@@ -106,7 +106,7 @@ def create_pipeline_diagram():
     ax.axis('off')
     
     plt.tight_layout()
-    plt.savefig('performance_analysis/pipeline_diagram.png', dpi=300, bbox_inches='tight')
+    plt.savefig('benchmarks/pipeline_diagram.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 def create_performance_breakdown(secrets, logs):
@@ -184,7 +184,7 @@ def create_performance_breakdown(secrets, logs):
                 f'{severity}', ha='center', va='bottom', fontsize=9, weight='bold')
     
     plt.tight_layout()
-    plt.savefig('performance_analysis/performance_breakdown.png', dpi=300, bbox_inches='tight')
+    plt.savefig('benchmarks/performance_breakdown.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 def create_verification_analysis(secrets):
@@ -248,7 +248,7 @@ def create_verification_analysis(secrets):
                 fontsize=11, ha='center', color='green', weight='bold')
     
     plt.tight_layout()
-    plt.savefig('performance_analysis/verification_analysis.png', dpi=300, bbox_inches='tight')
+    plt.savefig('benchmarks/verification_analysis.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 def create_concurrency_analysis():
@@ -307,7 +307,7 @@ def create_concurrency_analysis():
     ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('performance_analysis/concurrency_analysis.png', dpi=300, bbox_inches='tight')
+    plt.savefig('benchmarks/concurrency_analysis.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 def create_repository_analysis(secrets):
@@ -344,7 +344,7 @@ def create_repository_analysis(secrets):
         ax2.set_title('Secrets by File Type', fontsize=14, weight='bold')
     
     plt.tight_layout()
-    plt.savefig('performance_analysis/repository_analysis.png', dpi=300, bbox_inches='tight')
+    plt.savefig('benchmarks/repository_analysis.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 def main():
@@ -352,7 +352,7 @@ def main():
     print("🎨 Generating TruffleHog Performance Visualizations...")
     
     # Create output directory
-    os.makedirs('performance_analysis', exist_ok=True)
+    os.makedirs('benchmarks', exist_ok=True)
     
     # Load data
     secrets, logs = load_scan_data('figma_comprehensive_scan.json')
@@ -376,7 +376,7 @@ def main():
     create_repository_analysis(secrets)
     
     print("✨ All visualizations generated successfully!")
-    print("📂 Check the performance_analysis/ directory for all graphs")
+    print("📂 Check the benchmarks/ directory for all graphs")
 
 if __name__ == "__main__":
     main()

@@ -107,14 +107,14 @@ This analysis was conducted using:
 
 ## 📝 Files in This Analysis
 
-- `PERFORMANCE_ANALYSIS.md` - Comprehensive technical analysis
-- `optimization_implementation.go` - Ready-to-use optimized code
-- `pipeline_diagram.png` - Visual pipeline architecture
-- `performance_breakdown.png` - Time distribution charts
-- `concurrency_analysis.png` - Worker pool analysis
-- `verification_analysis.png` - Verification performance
-- `repository_analysis.png` - Repository patterns
-- `generate_visualizations.py` - Visualization generation code
+- `benchmarks/PERFORMANCE_ANALYSIS.md` - Comprehensive technical analysis
+- `benchmarks/optimization_implementation.go` - Ready-to-use optimized code
+- `benchmarks/pipeline_diagram.png` - Visual pipeline architecture
+- `benchmarks/performance_breakdown.png` - Time distribution charts
+- `benchmarks/concurrency_analysis.png` - Worker pool analysis
+- `benchmarks/verification_analysis.png` - Verification performance
+- `benchmarks/repository_analysis.png` - Repository patterns
+- `benchmarks/generate_visualizations.py` - Visualization generation code
 
 ## 🎯 Bottom Line
 
