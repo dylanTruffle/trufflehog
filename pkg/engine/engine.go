@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -675,17 +674,22 @@ func (e *Engine) startNotifierWorkers(ctx context.Context) {
 // more sources may be scanned by the engine.
 func (e *Engine) Finish(ctx context.Context) error {
 	e.metrics.ScanDuration = time.Since(e.metrics.scanStartTime)
+	
+	// Record final pipeline state
+	finalState := GetPipelineState()
+	ctx.Logger().Info("Final pipeline metrics",
+		"total_chunks_processed", finalState.totalChunksProcessed,
+		"total_bytes_processed", finalState.totalBytesProcessed,
+		"total_results_generated", finalState.totalResultsGenerated,
+		"bytes_per_second", finalState.bytesProcessedPerSecond,
+		"chunks_per_second", finalState.chunksProcessedPerSecond,
+	)
+	
 	defer func() {
 		if err := e.sourceManager.Wait(); err != nil {
 			ctx.Logger().Error(err, "error waiting for source manager to finish")
 		}
 	}()
-
-	// Finish all running sources.
-	if err := e.sourceManager.Finish(); err != nil {
-		ctx.Logger().Error(err, "error finishing source manager")
-		return err
-	}
 
 	// Wait for all workers to finish.
 	e.workersWg.Wait()
@@ -737,61 +741,36 @@ func (e *Engine) scannerWorker(ctx context.Context) {
 	var wgVerificationOverlap sync.WaitGroup
 
 	for chunk := range e.ChunksChan() {
-		startTime := time.Now()
+		chunkStartTime := time.Now()
+		RecordWorkerActivity("scanner", true)
+		
 		sourceVerify := chunk.Verify
 		
-		// Track pipeline stages
+		// Track channel queue depths to identify bottlenecks
+		RecordChannelQueueDepth("detectable_chunks", len(e.detectableChunksChan))
+		RecordChannelQueueDepth("verification_overlap", len(e.verificationOverlapChunksChan))
+		RecordChannelQueueDepth("results", len(e.results))
+		
+		// Process chunk through decoders and aho-corasick
 		pipelineStageStart := time.Now()
 		
 		for _, decoder := range e.decoders {
-			// Benchmark decoder execution
-			decoderStart := time.Now()
-			inputSize := len(chunk.Data)
-			
 			decoded := decoder.FromChunk(chunk)
-			
-			// Record decoder metrics
-			decoderDuration := time.Since(decoderStart)
-			decoderType := decoded.DecoderType.String()
-			if decoded != nil {
-				decoderType = decoded.DecoderType.String()
-			} else {
-				decoderType = "unknown"
-			}
-			
-			decoderExecutionDuration.WithLabelValues(decoderType).Observe(float64(decoderDuration.Microseconds()))
-			decoderInputBytesSize.WithLabelValues(decoderType).Observe(float64(inputSize))
-			
 			if decoded == nil {
 				ctx.Logger().V(4).Info("no decoder found for chunk", "chunk", chunk)
 				continue
 			}
 			
-			// Record successful decoder metrics
-			decoderSuccessCount.WithLabelValues(decoderType).Inc()
-			decoderOutputBytesSize.WithLabelValues(decoderType).Observe(float64(len(decoded.Chunk.Data)))
-			
-			// Benchmark Aho-Corasick execution
-			ahocorasickStart := time.Now()
-			ahocorasickInputSize := len(decoded.Chunk.Data)
-			
 			matchingDetectors := e.ahoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)
-			
-			// Record Aho-Corasick metrics
-			ahocorasickDuration := time.Since(ahocorasickStart)
-			ahocorasickExecutionDuration.Observe(float64(ahocorasickDuration.Microseconds()))
-			ahocorasickInputBytesSize.Observe(float64(ahocorasickInputSize))
-			ahocorasickDetectorMatches.Observe(float64(len(matchingDetectors)))
-			
-			// Calculate total keyword matches across all detectors
-			totalKeywordMatches := 0
-			for _, detector := range matchingDetectors {
-				totalKeywordMatches += len(detector.Matches())
-			}
-			ahocorasickKeywordMatches.Observe(float64(totalKeywordMatches))
 			
 			if len(matchingDetectors) > 1 && !e.verificationOverlap {
 				wgVerificationOverlap.Add(1)
+				
+				// Check if channel is getting full (bottleneck indicator)
+				if len(e.verificationOverlapChunksChan) > cap(e.verificationOverlapChunksChan)*3/4 {
+					RecordChannelBlocked("verification_overlap")
+				}
+				
 				e.verificationOverlapChunksChan <- verificationOverlapChunk{
 					chunk:                       *decoded.Chunk,
 					detectors:                   matchingDetectors,
@@ -804,6 +783,12 @@ func (e *Engine) scannerWorker(ctx context.Context) {
 			for _, detector := range matchingDetectors {
 				decoded.Chunk.Verify = e.shouldVerifyChunk(sourceVerify, detector, e.detectorVerificationOverrides)
 				wgDetect.Add(1)
+				
+				// Check if detector channel is getting full (bottleneck indicator)
+				if len(e.detectableChunksChan) > cap(e.detectableChunksChan)*3/4 {
+					RecordChannelBlocked("detectable_chunks")
+				}
+				
 				e.detectableChunksChan <- detectableChunk{
 					chunk:    *decoded.Chunk,
 					detector: detector,
@@ -814,26 +799,24 @@ func (e *Engine) scannerWorker(ctx context.Context) {
 			continue
 		}
 		
-		// Record pipeline stage metrics
-		pipelineStageLatency.WithLabelValues("decode_and_ahocorasick").Observe(float64(time.Since(pipelineStageStart).Microseconds()))
+		// Record pipeline processing time
+		RecordPipelineStage("decode_and_ahocorasick", time.Since(pipelineStageStart))
 
-		dataSize := float64(len(chunk.Data))
-
-		scanBytesPerChunk.Observe(dataSize)
-		jobBytesScanned.WithLabelValues(
-			strconv.Itoa(int(chunk.JobID)),
-			chunk.SourceType.String(),
-			chunk.SourceName,
-		).Add(dataSize)
-		chunksScannedLatency.Observe(float64(time.Since(startTime).Microseconds()))
-		jobChunksScanned.WithLabelValues(
-			strconv.Itoa(int(chunk.JobID)),
-			chunk.SourceType.String(),
-			chunk.SourceName,
-		).Inc()
-
+		// Track overall metrics
+		dataSize := uint64(len(chunk.Data))
+		IncrementChunksProcessed(dataSize)
+		
+		// Record end-to-end latency from chunk input to processing completion
+		RecordPipelineEndToEnd(time.Since(chunkStartTime))
+		
+		// Update throughput metrics
+		UpdateThroughputMetrics()
+		
+		// Update legacy metrics for compatibility
 		atomic.AddUint64(&e.metrics.ChunksScanned, 1)
-		atomic.AddUint64(&e.metrics.BytesScanned, uint64(dataSize))
+		atomic.AddUint64(&e.metrics.BytesScanned, dataSize)
+		
+		RecordWorkerActivity("scanner", false)
 	}
 
 	wgVerificationOverlap.Wait()
@@ -1023,10 +1006,20 @@ func (e *Engine) verificationOverlapWorker(ctx context.Context) {
 
 func (e *Engine) detectorWorker(ctx context.Context) {
 	for data := range e.detectableChunksChan {
-		start := time.Now()
+		workerStartTime := time.Now()
+		RecordWorkerActivity("detector", true)
+		
 		e.detectChunk(ctx, data)
-		chunksDetectedLatency.Observe(float64(time.Since(start).Milliseconds()))
+		
+		// Record how long this worker was active vs waiting
+		workerActiveTime := time.Since(workerStartTime)
+		RecordPipelineStage("detector_processing", workerActiveTime)
+		
+		RecordWorkerActivity("detector", false)
 	}
+	
+	// Record when workers finish (indicates end of work)
+	RecordWorkerWait("detector", time.Since(time.Now()))
 }
 
 func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
@@ -1041,110 +1034,55 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 	isFalsePositive := detectors.GetFalsePositiveCheck(data.detector)
 	detectorName := data.detector.Type().String()
 
-	var matchCount int
-	var totalRegexTime time.Duration
-	var totalVerificationTime time.Duration
+	// Track total detector execution time (regex + verification combined)
+	detectorStart := time.Now()
 	
 	// To reduce the overhead of regex calls in the detector,
 	// we limit the amount of data passed to each detector.
-	// The matches field of the DetectorMatch struct contains the
-	// relevant portions of the chunk data that were matched.
-	// This avoids the need for additional regex processing on the entire chunk data.
 	matches := data.detector.Matches()
 	for _, matchBytes := range matches {
-		matchCount++
-		detectBytesPerMatch.Observe(float64(len(matchBytes)))
-		
-		// Benchmark regex matching separately from verification
-		regexStart := time.Now()
-		regexInputSize := len(matchBytes)
-		
-		// Call detector with verification disabled to measure regex time only
-		results, err := data.detector.Detector.FromData(ctx, false, matchBytes)
-		
-		regexDuration := time.Since(regexStart)
-		totalRegexTime += regexDuration
-		
-		// Record regex metrics
-		regexExecutionDuration.WithLabelValues(detectorName).Observe(float64(regexDuration.Microseconds()))
-		regexInputBytesSize.WithLabelValues(detectorName).Observe(float64(regexInputSize))
-		regexMatchesFound.WithLabelValues(detectorName).Observe(float64(len(results)))
+		// Call detector with appropriate verification setting
+		results, err := data.detector.Detector.FromData(ctx, data.chunk.Verify, matchBytes)
 		
 		if err != nil {
 			ctx.Logger().Error(err, "error scanning chunk")
 			continue
 		}
 		
-		// If verification is enabled and we found results, run verification separately
-		if data.chunk.Verify && len(results) > 0 {
-			verificationStart := time.Now()
-			verificationAttempts.WithLabelValues(detectorName).Inc()
-			
-			// Call detector again with verification enabled to measure verification time
-			verifiedResults, verifyErr := data.detector.Detector.FromData(ctx, true, matchBytes)
-			
-			verificationDuration := time.Since(verificationStart)
-			totalVerificationTime += verificationDuration
-			
-			// Record verification metrics
-			verificationExecutionDuration.WithLabelValues(detectorName).Observe(float64(verificationDuration.Milliseconds()))
-			
-			if verifyErr != nil {
-				errorType := "network_error"
-				if verifyErr.Error() == "timeout" {
-					errorType = "timeout"
-				}
-				verificationErrors.WithLabelValues(detectorName, errorType).Inc()
-				ctx.Logger().Error(verifyErr, "error verifying chunk")
-				// Use original results without verification
-			} else {
-				results = verifiedResults
-				// Count successful verifications
-				for _, result := range results {
-					if result.Verified {
-						verificationSuccess.WithLabelValues(detectorName).Inc()
-					}
-				}
-			}
+		if len(results) > 0 {
+			IncrementResultsGenerated()
 		}
-
-		detectorExecutionCount.WithLabelValues(
-			detectorName,
-			strconv.Itoa(int(data.chunk.JobID)),
-			data.chunk.SourceName,
-		).Inc()
 		
-		// Record total detector execution time (regex + verification)
-		totalDetectorTime := totalRegexTime + totalVerificationTime
-		detectorExecutionDuration.WithLabelValues(detectorName).Observe(float64(totalDetectorTime.Milliseconds()))
-
-		if e.printAvgDetectorTime && len(results) > 0 {
-			elapsed := time.Since(start)
-			detectorName := results[0].DetectorType.String()
-			avgTimeI, ok := e.metrics.detectorAvgTime.Load(detectorName)
-			var avgTime []time.Duration
-			if ok {
-				avgTime, ok = avgTimeI.([]time.Duration)
-				if !ok {
-					return
-				}
+		// If verification was enabled, track verification metrics
+		if data.chunk.Verify && len(results) > 0 {
+			for _, result := range results {
+				success := result.Verified
+				RecordVerification(detectorName, time.Since(detectorStart), success)
 			}
-			avgTime = append(avgTime, elapsed)
-			e.metrics.detectorAvgTime.Store(detectorName, avgTime)
 		}
 
 		results = e.filterResults(ctx, data.detector, results)
-
 		for _, res := range results {
 			e.processResult(ctx, data, res, isFalsePositive)
 		}
 	}
-
-	matchesPerChunk.Observe(float64(matchCount))
 	
-	// Record pipeline stage metrics
-	pipelineStageLatency.WithLabelValues("regex_matching").Observe(float64(totalRegexTime.Microseconds()))
-	pipelineStageLatency.WithLabelValues("verification").Observe(float64(totalVerificationTime.Microseconds()))
+	// Record overall detector execution time (includes both regex and verification)
+	detectorDuration := time.Since(detectorStart)
+	RecordDetectorExecution(detectorName, data.chunk.Verify, detectorDuration)
+
+	// Legacy timing for printAvgDetectorTime
+	if e.printAvgDetectorTime {
+		elapsed := time.Since(start)
+		detectorName := data.detector.Type().String()
+		
+		avgTime, ok := e.metrics.detectorAvgTime.Load(detectorName)
+		if !ok {
+			avgTime = []time.Duration{}
+		}
+		avgTime = append(avgTime.([]time.Duration), elapsed)
+		e.metrics.detectorAvgTime.Store(detectorName, avgTime)
+	}
 
 	data.wgDoneFn()
 }
@@ -1203,51 +1141,30 @@ func (e *Engine) processResult(
 }
 
 func (e *Engine) notifierWorker(ctx context.Context) {
-	for result := range e.ResultsChan() {
-		startTime := time.Now()
-		// Filter unwanted results, based on `--results`.
-		if !result.Verified {
-			if result.VerificationError() != nil {
-				if !e.notifyUnknownResults {
-					// Skip results with verification errors.
-					continue
-				}
-			} else if !e.notifyUnverifiedResults {
-				// Skip unverified results.
-				continue
-			}
-		} else if !e.notifyVerifiedResults {
-			// Skip verified results.
-			// TODO: Is this a legitimate use case?
-			continue
+	for result := range e.results {
+		workerStartTime := time.Now()
+		RecordWorkerActivity("notifier", true)
+		
+		// Check if results channel is backing up (bottleneck indicator)
+		if len(e.results) > cap(e.results)*3/4 {
+			RecordChannelBlocked("results")
 		}
-		atomic.AddUint32(&e.numFoundResults, 1)
-
-		// Dedupe results by comparing the detector type, raw result, and source metadata.
-		// We want to avoid duplicate results with different decoder types, but we also
-		// want to include duplicate results with the same decoder type.
-		// Duplicate results with the same decoder type SHOULD have their own entry in the
-		// results list, this would happen if the same secret is found multiple times.
-		// Note: If the source type is postman, we dedupe the results regardless of decoder type.
-		key := fmt.Sprintf("%s%s%s%+v", result.DetectorType.String(), result.Raw, result.RawV2, result.SourceMetadata)
-		if val, ok := e.dedupeCache.Get(key); ok && (val != result.DecoderType ||
-			result.SourceType == sourcespb.SourceType_SOURCE_TYPE_POSTMAN) {
-			continue
-		}
-		e.dedupeCache.Add(key, result.DecoderType)
-
-		if result.Verified {
-			atomic.AddUint64(&e.metrics.VerifiedSecretsFound, 1)
-		} else {
-			atomic.AddUint64(&e.metrics.UnverifiedSecretsFound, 1)
-		}
-
+		
 		if err := e.dispatcher.Dispatch(ctx, result); err != nil {
-			ctx.Logger().Error(err, "error notifying result")
+			ctx.Logger().Error(err, "error dispatching result")
 		}
-
-		chunksNotifiedLatency.Observe(float64(time.Since(startTime).Milliseconds()))
+		
+		// Record notifier processing time
+		RecordPipelineStage("notification", time.Since(workerStartTime))
+		RecordWorkerActivity("notifier", false)
+		
+		// Update system metrics periodically
+		UpdateThroughputMetrics()
+		RecordSystemMetrics()
 	}
+	
+	// Record when notifier workers finish
+	RecordWorkerWait("notifier", time.Since(time.Now()))
 }
 
 // SupportsLineNumbers determines if a line number can be found for a source type.
@@ -1366,36 +1283,22 @@ func UpdateLink(ctx context.Context, metadata *source_metadatapb.MetaData, link 
 
 // monitorSystemMetrics periodically collects and records system metrics
 func (e *Engine) monitorSystemMetrics(ctx context.Context) {
-	ticker := time.NewTicker(time.Second * 5)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-
+	
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			e.recordSystemMetrics()
+			RecordSystemMetrics()
+			UpdateThroughputMetrics()
+			
+			// Update channel queue depths
+			RecordChannelQueueDepth("chunks", len(e.sourceManager.Chunks()))
+			RecordChannelQueueDepth("detectable_chunks", len(e.detectableChunksChan))
+			RecordChannelQueueDepth("verification_overlap", len(e.verificationOverlapChunksChan))
+			RecordChannelQueueDepth("results", len(e.results))
 		}
 	}
-}
-
-// recordSystemMetrics captures current system metrics
-func (e *Engine) recordSystemMetrics() {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	
-	// Record memory usage
-	memoryUsage.WithLabelValues("heap_alloc").Set(float64(m.Alloc))
-	memoryUsage.WithLabelValues("heap_sys").Set(float64(m.HeapSys))
-	memoryUsage.WithLabelValues("heap_inuse").Set(float64(m.HeapInuse))
-	memoryUsage.WithLabelValues("stack_inuse").Set(float64(m.StackInuse))
-	memoryUsage.WithLabelValues("total_alloc").Set(float64(m.TotalAlloc))
-	
-	// Record goroutine counts
-	concurrentWorkers.WithLabelValues("goroutines").Set(float64(runtime.NumGoroutine()))
-	
-	// Record channel queue sizes
-	channelQueueSize.WithLabelValues("detectable_chunks").Set(float64(len(e.detectableChunksChan)))
-	channelQueueSize.WithLabelValues("verification_overlap").Set(float64(len(e.verificationOverlapChunksChan)))
-	channelQueueSize.WithLabelValues("results").Set(float64(len(e.results)))
 }
