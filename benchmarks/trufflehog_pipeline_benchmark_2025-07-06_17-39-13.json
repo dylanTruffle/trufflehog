@@ -1,0 +1,55 @@
+{
+  "scan_duration": "136.683µs",
+  "total_repositories": 0,
+  "overall_throughput_mbps": 0,
+  "pipeline_bottlenecks": [
+    {
+      "stage": "chunks",
+      "channel_utilization_percent": 0,
+      "blocked_writes_per_second": 0,
+      "average_latency_ms": 0,
+      "bottleneck_severity": "LOW"
+    },
+    {
+      "stage": "detectable_chunks",
+      "channel_utilization_percent": 0,
+      "blocked_writes_per_second": 0,
+      "average_latency_ms": 0,
+      "bottleneck_severity": "LOW"
+    },
+    {
+      "stage": "verification_overlap",
+      "channel_utilization_percent": 0,
+      "blocked_writes_per_second": 0,
+      "average_latency_ms": 0,
+      "bottleneck_severity": "LOW"
+    },
+    {
+      "stage": "results",
+      "channel_utilization_percent": 0,
+      "blocked_writes_per_second": 0,
+      "average_latency_ms": 0,
+      "bottleneck_severity": "LOW"
+    }
+  ],
+  "concurrency_metrics": {
+    "worker_utilization_percent": {},
+    "worker_starvation_events": {},
+    "channel_saturation_percent": {},
+    "concurrency_efficiency_percent": 0
+  },
+  "top_slow_detectors": null,
+  "system_resource_usage": {
+    "peak_memory_usage_mb": 0,
+    "average_goroutines": 0,
+    "gc_pause_time_p95_ms": 0,
+    "system_bottlenecks": null
+  },
+  "recommendations": [
+    "⚡ Worker efficiency is low. Consider reducing concurrency to match available work or optimizing worker algorithms.",
+    "🚀 Low overall throughput. Focus on the highest severity bottlenecks identified above.",
+    "📊 Monitor Prometheus metrics at http://localhost:2112/metrics for real-time pipeline analysis",
+    "🎯 For production scans, focus on optimizing the bottlenecks with 'HIGH' severity first"
+  ],
+  "prometheus_metrics_url": "http://localhost:2112/metrics"
+}

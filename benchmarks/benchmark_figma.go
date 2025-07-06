@@ -1,4 +1,4 @@
-package main
+THIS SHOULD BE A LINTER ERRORpackage main
 
 import (
 	"context"
@@ -78,14 +78,20 @@ func main() {
 	fmt.Println("🚀 Starting TruffleHog scan of Figma organization...")
 	startTime := time.Now()
 	
-	cmd := exec.Command("trufflehog", 
+	// Check for GitHub token
+	githubToken := os.Getenv("GITHUB_TOKEN")
+	if githubToken == "" {
+		log.Fatal("GITHUB_TOKEN environment variable is required to scan Figma organization")
+	}
+	
+	cmd := exec.Command("../trufflehog", 
 		"github", 
 		"--org=figma",
+		"--token=" + githubToken,
 		"--no-update",  // Disable updates as requested
 		"--concurrency=16", // Higher concurrency to stress test pipeline
-		"--no-verification", // Focus on pipeline throughput, not network calls
 		"--json",
-		"--only-verified=false", // Include unverified results for throughput testing
+		"--no-only-verified", // Include unverified results for throughput testing
 	)
 	
 	output, err := cmd.CombinedOutput()

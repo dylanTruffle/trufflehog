@@ -1,0 +1,44 @@
+🔍 TruffleHog Pipeline Performance Benchmark - Figma Organization
+================================================================================
+2025/07/06 17:39:08 Prometheus metrics available at http://localhost:2112/metrics
+🚀 Starting TruffleHog scan of Figma organization...
+2025/07/06 17:39:10 TruffleHog scan completed with warnings: exec: "trufflehog": executable file not found in $PATH
+✅ Scan completed in 136.683µs
+📊 Scanned 0 repositories
+
+📈 Analyzing pipeline performance metrics...
+
+================================================================================
+🎯 TRUFFLEHOG PIPELINE PERFORMANCE ANALYSIS
+================================================================================
+📊 SCAN OVERVIEW:
+   Duration: 136.683µs
+   Repositories: 0
+   Throughput: 0.00 MB/s
+
+🚨 PIPELINE BOTTLENECKS (by severity):
+   1. 🟢 chunks: 0.0% utilization, 0.0 blocked writes/sec, 0.0ms avg latency
+   2. 🟢 detectable_chunks: 0.0% utilization, 0.0 blocked writes/sec, 0.0ms avg latency
+   3. 🟢 verification_overlap: 0.0% utilization, 0.0 blocked writes/sec, 0.0ms avg latency
+   4. 🟢 results: 0.0% utilization, 0.0 blocked writes/sec, 0.0ms avg latency
+
+⚡ CONCURRENCY ANALYSIS:
+   Overall Efficiency: 0.0%
+   Worker Utilization:
+
+🐌 SLOWEST DETECTORS:
+
+💾 SYSTEM RESOURCES:
+   Peak Memory: 0.0 MB
+   Avg Goroutines: 0
+   GC Pause P95: 0.0ms
+
+🎯 RECOMMENDATIONS:
+   1. ⚡ Worker efficiency is low. Consider reducing concurrency to match available work or optimizing worker algorithms.
+   2. 🚀 Low overall throughput. Focus on the highest severity bottlenecks identified above.
+   3. 📊 Monitor Prometheus metrics at http://localhost:2112/metrics for real-time pipeline analysis
+   4. 🎯 For production scans, focus on optimizing the bottlenecks with 'HIGH' severity first
+
+💾 Detailed results saved to: trufflehog_pipeline_benchmark_2025-07-06_17-39-13.json
+
+🎯 Benchmark complete! Prometheus metrics available at http://localhost:2112/metrics
