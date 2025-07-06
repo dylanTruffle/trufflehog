@@ -7,3 +7,8 @@ dist
 trufflehog
 
 hi naham
+tmp/go-test.json
+.captain/detectors/timings.yaml
+.captain/detectors/quarantines.yaml
+.captain/detectors/flakes.yaml
+.vscode
