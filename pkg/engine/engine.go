@@ -567,9 +567,12 @@ func (e *Engine) DetectorAvgTime() map[string][]time.Duration {
 // detectors, and kickstarts all necessary workers. Once started, the engine
 // begins processing input data to identify secrets.
 func (e *Engine) Start(ctx context.Context) {
-	e.metrics = runtimeMetrics{Metrics: Metrics{scanStartTime: time.Now()}}
+	e.metrics.scanStartTime = time.Now()
 	e.sanityChecks(ctx)
 	e.startWorkers(ctx)
+	
+	// Start goroutine to monitor memory usage and worker counts
+	go e.monitorSystemMetrics(ctx)
 }
 
 var defaultChannelBuffer = runtime.NumCPU()
@@ -671,24 +674,29 @@ func (e *Engine) startNotifierWorkers(ctx context.Context) {
 // chunks before closing their respective channels. Once Finish is called, no
 // more sources may be scanned by the engine.
 func (e *Engine) Finish(ctx context.Context) error {
-	defer common.RecoverWithExit(ctx)
-	// Wait for the sources to finish putting chunks onto the chunks channel.
-	err := e.sourceManager.Wait()
-
-	e.workersWg.Wait() // Wait for the workers to finish scanning chunks.
-
-	close(e.verificationOverlapChunksChan)
-	e.verificationOverlapWg.Wait()
-
-	close(e.detectableChunksChan)
-	e.wgDetectorWorkers.Wait() // Wait for the detector workers to finish detecting chunks.
-
-	close(e.results)    // Detector workers are done, close the results channel and call it a day.
-	e.WgNotifier.Wait() // Wait for the notifier workers to finish notifying results.
-
 	e.metrics.ScanDuration = time.Since(e.metrics.scanStartTime)
+	defer func() {
+		if err := e.sourceManager.Wait(); err != nil {
+			ctx.Logger().Error(err, "error waiting for source manager to finish")
+		}
+	}()
 
-	return err
+	// Finish all running sources.
+	if err := e.sourceManager.Finish(); err != nil {
+		ctx.Logger().Error(err, "error finishing source manager")
+		return err
+	}
+
+	// Wait for all workers to finish.
+	e.workersWg.Wait()
+	e.WgNotifier.Wait()
+
+	// Make sure all the results have been flushed from the channels.
+	close(e.results)
+	for range e.results {
+	}
+
+	return nil
 }
 
 func (e *Engine) ChunksChan() <-chan *sources.Chunk {
@@ -731,14 +739,57 @@ func (e *Engine) scannerWorker(ctx context.Context) {
 	for chunk := range e.ChunksChan() {
 		startTime := time.Now()
 		sourceVerify := chunk.Verify
+		
+		// Track pipeline stages
+		pipelineStageStart := time.Now()
+		
 		for _, decoder := range e.decoders {
+			// Benchmark decoder execution
+			decoderStart := time.Now()
+			inputSize := len(chunk.Data)
+			
 			decoded := decoder.FromChunk(chunk)
+			
+			// Record decoder metrics
+			decoderDuration := time.Since(decoderStart)
+			decoderType := decoded.DecoderType.String()
+			if decoded != nil {
+				decoderType = decoded.DecoderType.String()
+			} else {
+				decoderType = "unknown"
+			}
+			
+			decoderExecutionDuration.WithLabelValues(decoderType).Observe(float64(decoderDuration.Microseconds()))
+			decoderInputBytesSize.WithLabelValues(decoderType).Observe(float64(inputSize))
+			
 			if decoded == nil {
 				ctx.Logger().V(4).Info("no decoder found for chunk", "chunk", chunk)
 				continue
 			}
-
+			
+			// Record successful decoder metrics
+			decoderSuccessCount.WithLabelValues(decoderType).Inc()
+			decoderOutputBytesSize.WithLabelValues(decoderType).Observe(float64(len(decoded.Chunk.Data)))
+			
+			// Benchmark Aho-Corasick execution
+			ahocorasickStart := time.Now()
+			ahocorasickInputSize := len(decoded.Chunk.Data)
+			
 			matchingDetectors := e.ahoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)
+			
+			// Record Aho-Corasick metrics
+			ahocorasickDuration := time.Since(ahocorasickStart)
+			ahocorasickExecutionDuration.Observe(float64(ahocorasickDuration.Microseconds()))
+			ahocorasickInputBytesSize.Observe(float64(ahocorasickInputSize))
+			ahocorasickDetectorMatches.Observe(float64(len(matchingDetectors)))
+			
+			// Calculate total keyword matches across all detectors
+			totalKeywordMatches := 0
+			for _, detector := range matchingDetectors {
+				totalKeywordMatches += len(detector.Matches())
+			}
+			ahocorasickKeywordMatches.Observe(float64(totalKeywordMatches))
+			
 			if len(matchingDetectors) > 1 && !e.verificationOverlap {
 				wgVerificationOverlap.Add(1)
 				e.verificationOverlapChunksChan <- verificationOverlapChunk{
@@ -762,6 +813,9 @@ func (e *Engine) scannerWorker(ctx context.Context) {
 			}
 			continue
 		}
+		
+		// Record pipeline stage metrics
+		pipelineStageLatency.WithLabelValues("decode_and_ahocorasick").Observe(float64(time.Since(pipelineStageStart).Microseconds()))
 
 		dataSize := float64(len(chunk.Data))
 
@@ -985,8 +1039,12 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 	defer cancel()
 
 	isFalsePositive := detectors.GetFalsePositiveCheck(data.detector)
+	detectorName := data.detector.Type().String()
 
 	var matchCount int
+	var totalRegexTime time.Duration
+	var totalVerificationTime time.Duration
+	
 	// To reduce the overhead of regex calls in the detector,
 	// we limit the amount of data passed to each detector.
 	// The matches field of the DetectorMatch struct contains the
@@ -996,20 +1054,69 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 	for _, matchBytes := range matches {
 		matchCount++
 		detectBytesPerMatch.Observe(float64(len(matchBytes)))
-		results, err := data.detector.Detector.FromData(ctx, data.chunk.Verify, matchBytes)
+		
+		// Benchmark regex matching separately from verification
+		regexStart := time.Now()
+		regexInputSize := len(matchBytes)
+		
+		// Call detector with verification disabled to measure regex time only
+		results, err := data.detector.Detector.FromData(ctx, false, matchBytes)
+		
+		regexDuration := time.Since(regexStart)
+		totalRegexTime += regexDuration
+		
+		// Record regex metrics
+		regexExecutionDuration.WithLabelValues(detectorName).Observe(float64(regexDuration.Microseconds()))
+		regexInputBytesSize.WithLabelValues(detectorName).Observe(float64(regexInputSize))
+		regexMatchesFound.WithLabelValues(detectorName).Observe(float64(len(results)))
+		
 		if err != nil {
 			ctx.Logger().Error(err, "error scanning chunk")
 			continue
 		}
+		
+		// If verification is enabled and we found results, run verification separately
+		if data.chunk.Verify && len(results) > 0 {
+			verificationStart := time.Now()
+			verificationAttempts.WithLabelValues(detectorName).Inc()
+			
+			// Call detector again with verification enabled to measure verification time
+			verifiedResults, verifyErr := data.detector.Detector.FromData(ctx, true, matchBytes)
+			
+			verificationDuration := time.Since(verificationStart)
+			totalVerificationTime += verificationDuration
+			
+			// Record verification metrics
+			verificationExecutionDuration.WithLabelValues(detectorName).Observe(float64(verificationDuration.Milliseconds()))
+			
+			if verifyErr != nil {
+				errorType := "network_error"
+				if verifyErr.Error() == "timeout" {
+					errorType = "timeout"
+				}
+				verificationErrors.WithLabelValues(detectorName, errorType).Inc()
+				ctx.Logger().Error(verifyErr, "error verifying chunk")
+				// Use original results without verification
+			} else {
+				results = verifiedResults
+				// Count successful verifications
+				for _, result := range results {
+					if result.Verified {
+						verificationSuccess.WithLabelValues(detectorName).Inc()
+					}
+				}
+			}
+		}
 
 		detectorExecutionCount.WithLabelValues(
-			data.detector.Type().String(),
+			detectorName,
 			strconv.Itoa(int(data.chunk.JobID)),
 			data.chunk.SourceName,
 		).Inc()
-		detectorExecutionDuration.WithLabelValues(
-			data.detector.Type().String(),
-		).Observe(float64(time.Since(start).Milliseconds()))
+		
+		// Record total detector execution time (regex + verification)
+		totalDetectorTime := totalRegexTime + totalVerificationTime
+		detectorExecutionDuration.WithLabelValues(detectorName).Observe(float64(totalDetectorTime.Milliseconds()))
 
 		if e.printAvgDetectorTime && len(results) > 0 {
 			elapsed := time.Since(start)
@@ -1034,6 +1141,10 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 	}
 
 	matchesPerChunk.Observe(float64(matchCount))
+	
+	// Record pipeline stage metrics
+	pipelineStageLatency.WithLabelValues("regex_matching").Observe(float64(totalRegexTime.Microseconds()))
+	pipelineStageLatency.WithLabelValues("verification").Observe(float64(totalVerificationTime.Microseconds()))
 
 	data.wgDoneFn()
 }
@@ -1251,4 +1362,40 @@ func UpdateLink(ctx context.Context, metadata *source_metadatapb.MetaData, link 
 		return fmt.Errorf("unsupported metadata type")
 	}
 	return nil
+}
+
+// monitorSystemMetrics periodically collects and records system metrics
+func (e *Engine) monitorSystemMetrics(ctx context.Context) {
+	ticker := time.NewTicker(time.Second * 5)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.recordSystemMetrics()
+		}
+	}
+}
+
+// recordSystemMetrics captures current system metrics
+func (e *Engine) recordSystemMetrics() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	
+	// Record memory usage
+	memoryUsage.WithLabelValues("heap_alloc").Set(float64(m.Alloc))
+	memoryUsage.WithLabelValues("heap_sys").Set(float64(m.HeapSys))
+	memoryUsage.WithLabelValues("heap_inuse").Set(float64(m.HeapInuse))
+	memoryUsage.WithLabelValues("stack_inuse").Set(float64(m.StackInuse))
+	memoryUsage.WithLabelValues("total_alloc").Set(float64(m.TotalAlloc))
+	
+	// Record goroutine counts
+	concurrentWorkers.WithLabelValues("goroutines").Set(float64(runtime.NumGoroutine()))
+	
+	// Record channel queue sizes
+	channelQueueSize.WithLabelValues("detectable_chunks").Set(float64(len(e.detectableChunksChan)))
+	channelQueueSize.WithLabelValues("verification_overlap").Set(float64(len(e.verificationOverlapChunksChan)))
+	channelQueueSize.WithLabelValues("results").Set(float64(len(e.results)))
 }
