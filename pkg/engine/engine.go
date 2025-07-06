@@ -885,7 +885,7 @@ func (e *Engine) scannerWorker(ctx context.Context) {
 			chunk.SourceType.String(),
 			chunk.SourceName,
 		).Add(dataSize64)
-		chunksScannedLatency.Observe(float64(time.Since(startTime).Microseconds()))
+		chunksScannedLatency.Observe(float64(time.Since(chunkStartTime).Microseconds()))
 		jobChunksScanned.WithLabelValues(
 			chunk.SourceType.String(),
 			chunk.SourceName,
@@ -1138,6 +1138,7 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 	// To reduce the overhead of regex calls in the detector,
 	// we limit the amount of data passed to each detector.
 	matches := data.detector.Matches()
+	var matchCount int
 	for _, matchBytes := range matches {
 		matchCount++
 		detectBytesPerMatch.Observe(float64(len(matchBytes)))
