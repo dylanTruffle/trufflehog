@@ -58,6 +58,7 @@ var (
 	configFilename             = cli.Flag("config", "Path to configuration file.").ExistingFile()
 	// rules = cli.Flag("rules", "Path to file with custom rules.").String()
 	printAvgDetectorTime = cli.Flag("print-avg-detector-time", "Print the average time spent on each detector.").Bool()
+	detectorProfiling    = cli.Flag("detector-profiling", "Enable detailed detector profiling with min/max/total times and call counts.").Bool()
 	noUpdate             = cli.Flag("no-update", "Don't check for updates.").Bool()
 	fail                 = cli.Flag("fail", "Exit with code 183 if results are found.").Bool()
 	verifiers            = cli.Flag("verifier", "Set custom verification endpoints.").StringMap()
@@ -392,6 +393,7 @@ func run(state overseer.State) {
 		VerificationOverlap:   *allowVerificationOverlap,
 		Results:               parsedResults,
 		PrintAvgDetectorTime:  *printAvgDetectorTime,
+		DetectorProfiling:     *detectorProfiling,
 		ShouldScanEntireChunk: *scanEntireChunk,
 	}
 
@@ -750,6 +752,10 @@ func runSingleScan(ctx context.Context, cmd string, cfg engine.Config) (metrics,
 	if *printAvgDetectorTime {
 		printAverageDetectorTime(eng)
 	}
+	
+	if *detectorProfiling {
+		printDetailedDetectorProfiling(eng)
+	}
 
 	return metrics{Metrics: eng.GetMetrics(), hasFoundResults: eng.HasFoundResults()}, nil
 }
@@ -812,5 +818,188 @@ func printAverageDetectorTime(e *engine.Engine) {
 	)
 	for detectorName, duration := range e.GetDetectorsMetrics() {
 		fmt.Fprintf(os.Stderr, "%s: %s\n", detectorName, duration)
+	}
+}
+
+func generateDetectorProfilingReport(e *engine.Engine) string {
+	detectorMetrics := e.GetDetailedDetectorMetrics()
+	if len(detectorMetrics) == 0 {
+		return "# Detector Profiling Report\n\nNo detector profiling data available.\n"
+	}
+	
+	var report strings.Builder
+	report.WriteString("# Detector Profiling Report\n\n")
+	report.WriteString("This report shows detailed performance metrics for each detector during the scan.\n\n")
+	
+	// Sort detectors by total time (descending)
+	type detectorStat struct {
+		name string
+		metrics engine.DetectorMetrics
+	}
+	
+	var sortedStats []detectorStat
+	for name, metrics := range detectorMetrics {
+		sortedStats = append(sortedStats, detectorStat{name, metrics})
+	}
+	
+	// Sort by total time (descending)
+	for i := 0; i < len(sortedStats); i++ {
+		for j := i + 1; j < len(sortedStats); j++ {
+			if sortedStats[i].metrics.TotalTime < sortedStats[j].metrics.TotalTime {
+				sortedStats[i], sortedStats[j] = sortedStats[j], sortedStats[i]
+			}
+		}
+	}
+	
+	// Summary statistics
+	var totalTime time.Duration
+	var totalCalls uint64
+	for _, stat := range sortedStats {
+		totalTime += stat.metrics.TotalTime
+		totalCalls += stat.metrics.CallCount
+	}
+	
+	report.WriteString("## Summary\n\n")
+	report.WriteString(fmt.Sprintf("- **Total Detectors**: %d\n", len(sortedStats)))
+	report.WriteString(fmt.Sprintf("- **Total Execution Time**: %s\n", totalTime.Round(time.Microsecond)))
+	report.WriteString(fmt.Sprintf("- **Total Detector Calls**: %d\n", totalCalls))
+	if totalCalls > 0 {
+		avgTime := totalTime / time.Duration(totalCalls)
+		report.WriteString(fmt.Sprintf("- **Average Time per Call**: %s\n", avgTime.Round(time.Microsecond)))
+	}
+	report.WriteString("\n")
+	
+	// Top 10 slowest detectors
+	report.WriteString("## Top 10 Slowest Detectors (by total time)\n\n")
+	limit := 10
+	if len(sortedStats) < limit {
+		limit = len(sortedStats)
+	}
+	
+	for i := 0; i < limit; i++ {
+		stat := sortedStats[i]
+		report.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, stat.name))
+		report.WriteString(fmt.Sprintf("   - Total Time: %s\n", stat.metrics.TotalTime.Round(time.Microsecond)))
+		report.WriteString(fmt.Sprintf("   - Calls: %d\n", stat.metrics.CallCount))
+		report.WriteString(fmt.Sprintf("   - Average: %s\n", stat.metrics.AvgTime.Round(time.Microsecond)))
+		report.WriteString(fmt.Sprintf("   - Min: %s\n", stat.metrics.MinTime.Round(time.Microsecond)))
+		report.WriteString(fmt.Sprintf("   - Max: %s\n", stat.metrics.MaxTime.Round(time.Microsecond)))
+		report.WriteString("\n")
+	}
+	
+	// Full table
+	report.WriteString("## Complete Detector Performance Table\n\n")
+	report.WriteString("| Detector | Calls | Total Time | Average | Min | Max |\n")
+	report.WriteString("|----------|-------|------------|---------|-----|-----|\n")
+	
+	for _, stat := range sortedStats {
+		report.WriteString(fmt.Sprintf("| %s | %d | %s | %s | %s | %s |\n",
+			stat.name,
+			stat.metrics.CallCount,
+			stat.metrics.TotalTime.Round(time.Microsecond),
+			stat.metrics.AvgTime.Round(time.Microsecond),
+			stat.metrics.MinTime.Round(time.Microsecond),
+			stat.metrics.MaxTime.Round(time.Microsecond),
+		))
+	}
+	
+	report.WriteString("\n## Analysis\n\n")
+	if len(sortedStats) > 0 {
+		slowest := sortedStats[0]
+		report.WriteString(fmt.Sprintf("The slowest detector is **%s** with a total execution time of %s across %d calls.\n",
+			slowest.name,
+			slowest.metrics.TotalTime.Round(time.Microsecond),
+			slowest.metrics.CallCount,
+		))
+		
+		if len(sortedStats) > 1 {
+			report.WriteString(fmt.Sprintf("The top 3 detectors account for %.1f%% of total detection time.\n",
+				func() float64 {
+					limit := 3
+					if len(sortedStats) < limit {
+						limit = len(sortedStats)
+					}
+					var topTime time.Duration
+					for i := 0; i < limit; i++ {
+						topTime += sortedStats[i].metrics.TotalTime
+					}
+					return float64(topTime) / float64(totalTime) * 100
+				}(),
+			))
+		}
+	}
+	
+	return report.String()
+}
+
+func printDetailedDetectorProfiling(e *engine.Engine) {
+	detectorMetrics := e.GetDetailedDetectorMetrics()
+	if len(detectorMetrics) == 0 {
+		fmt.Fprintln(os.Stderr, "No detector profiling data available.")
+		return
+	}
+	
+	fmt.Fprintln(os.Stderr, "\n🔍 Detailed Detector Profiling Report")
+	fmt.Fprintln(os.Stderr, "=====================================")
+	
+	// Sort detectors by total time (descending)
+	type detectorStat struct {
+		name string
+		metrics engine.DetectorMetrics
+	}
+	
+	var sortedStats []detectorStat
+	for name, metrics := range detectorMetrics {
+		sortedStats = append(sortedStats, detectorStat{name, metrics})
+	}
+	
+	// Sort by total time (descending)
+	for i := 0; i < len(sortedStats); i++ {
+		for j := i + 1; j < len(sortedStats); j++ {
+			if sortedStats[i].metrics.TotalTime < sortedStats[j].metrics.TotalTime {
+				sortedStats[i], sortedStats[j] = sortedStats[j], sortedStats[i]
+			}
+		}
+	}
+	
+	fmt.Fprintf(os.Stderr, "%-30s %10s %10s %10s %10s %10s\n", "Detector", "Calls", "Total", "Avg", "Min", "Max")
+	fmt.Fprintln(os.Stderr, strings.Repeat("-", 80))
+	
+	for _, stat := range sortedStats {
+		fmt.Fprintf(os.Stderr, "%-30s %10d %10s %10s %10s %10s\n",
+			stat.name,
+			stat.metrics.CallCount,
+			stat.metrics.TotalTime.Round(time.Microsecond),
+			stat.metrics.AvgTime.Round(time.Microsecond),
+			stat.metrics.MinTime.Round(time.Microsecond),
+			stat.metrics.MaxTime.Round(time.Microsecond),
+		)
+	}
+	
+	fmt.Fprintln(os.Stderr, "\n📊 Top 5 Slowest Detectors (by total time):")
+	limit := 5
+	if len(sortedStats) < limit {
+		limit = len(sortedStats)
+	}
+	
+	for i := 0; i < limit; i++ {
+		stat := sortedStats[i]
+		fmt.Fprintf(os.Stderr, "%d. %s: %s total (%d calls, %s avg)\n",
+			i+1,
+			stat.name,
+			stat.metrics.TotalTime.Round(time.Microsecond),
+			stat.metrics.CallCount,
+			stat.metrics.AvgTime.Round(time.Microsecond),
+		)
+	}
+	
+	// Generate and write markdown report
+	report := generateDetectorProfilingReport(e)
+	filename := "detector_profiling_report.md"
+	
+	if err := os.WriteFile(filename, []byte(report), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing profiling report to %s: %v\n", filename, err)
+	} else {
+		fmt.Fprintf(os.Stderr, "\n📄 Detailed report written to: %s\n", filename)
 	}
 }

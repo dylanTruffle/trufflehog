@@ -34,6 +34,15 @@ var errOverlap = errors.New(
 		"You can override this behavior by using the --allow-verification-overlap flag.",
 )
 
+// DetectorMetrics holds detailed profiling information for a detector.
+type DetectorMetrics struct {
+	TotalTime  time.Duration
+	MinTime    time.Duration
+	MaxTime    time.Duration
+	CallCount  uint64
+	AvgTime    time.Duration
+}
+
 // Metrics for the scan engine for external consumption.
 type Metrics struct {
 	BytesScanned           uint64
@@ -41,6 +50,7 @@ type Metrics struct {
 	VerifiedSecretsFound   uint64
 	UnverifiedSecretsFound uint64
 	AvgDetectorTime        map[string]time.Duration
+	DetectorMetrics        map[string]DetectorMetrics
 
 	scanStartTime time.Time
 	ScanDuration  time.Duration
@@ -50,7 +60,8 @@ type Metrics struct {
 type runtimeMetrics struct {
 	mu sync.RWMutex
 	Metrics
-	detectorAvgTime sync.Map
+	detectorAvgTime     sync.Map
+	detectorProfiling   sync.Map // map[string]*DetectorMetrics
 }
 
 // getScanDuration returns the duration of the scan.
@@ -129,6 +140,10 @@ type Config struct {
 	// and should be avoided unless specified by the user.
 	PrintAvgDetectorTime bool
 
+	// DetectorProfiling enables detailed profiling of detector performance including
+	// min/max/total execution times and call counts for each detector.
+	DetectorProfiling bool
+
 	// VerificationOverlap determines whether the scanner will attempt to verify candidate secrets
 	// that have been detected by multiple detectors.
 	// By default, it is set to true.
@@ -159,6 +174,7 @@ type Engine struct {
 	retainFalsePositives    bool
 	verificationOverlap     bool
 	printAvgDetectorTime    bool
+	detectorProfiling       bool
 	// By default, the engine will only scan a subset of the chunk if a detector matches the chunk.
 	// If this flag is set to true, the engine will scan the entire chunk.
 	scanEntireChunk bool
@@ -206,6 +222,7 @@ func NewEngine(ctx context.Context, cfg *Config) (*Engine, error) {
 		filterUnverified:              cfg.FilterUnverified,
 		filterEntropy:                 cfg.FilterEntropy,
 		printAvgDetectorTime:          cfg.PrintAvgDetectorTime,
+		detectorProfiling:             cfg.DetectorProfiling,
 		retainFalsePositives:          cfg.LogFilteredUnverified,
 		verificationOverlap:           cfg.VerificationOverlap,
 		sourceManager:                 cfg.SourceManager,
@@ -517,6 +534,11 @@ func (e *Engine) GetMetrics() Metrics {
 		result.AvgDetectorTime[detectorName] = avgDuration
 	}
 
+	// Populate DetectorMetrics if profiling is enabled
+	if e.detectorProfiling {
+		result.DetectorMetrics = e.GetDetailedDetectorMetrics()
+	}
+
 	result.ScanDuration = e.metrics.getScanDuration()
 
 	return result
@@ -560,6 +582,27 @@ func (e *Engine) DetectorAvgTime() map[string][]time.Duration {
 		return true
 	})
 	return avgTime
+}
+
+// GetDetailedDetectorMetrics returns the detailed profiling metrics for all detectors
+func (e *Engine) GetDetailedDetectorMetrics() map[string]DetectorMetrics {
+	logger := context.Background().Logger()
+	detectorMetrics := make(map[string]DetectorMetrics)
+	e.metrics.detectorProfiling.Range(func(k, v any) bool {
+		key, ok := k.(string)
+		if !ok {
+			logger.Info("expected string key in detectorProfiling map", "key", k)
+			return true
+		}
+		value, ok := v.(*DetectorMetrics)
+		if !ok {
+			logger.Info("expected *DetectorMetrics value in detectorProfiling map", "value", v)
+			return true
+		}
+		detectorMetrics[key] = *value
+		return true
+	})
+	return detectorMetrics
 }
 
 // Start initializes and activates the engine's processing pipeline.
@@ -976,10 +1019,6 @@ func (e *Engine) detectorWorker(ctx context.Context) {
 }
 
 func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
-	var start time.Time
-	if e.printAvgDetectorTime {
-		start = time.Now()
-	}
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer common.Recover(ctx)
 	defer cancel()
@@ -996,7 +1035,12 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 	for _, matchBytes := range matches {
 		matchCount++
 		detectBytesPerMatch.Observe(float64(len(matchBytes)))
+		
+		// Time the detector execution
+		detectorStart := time.Now()
 		results, err := data.detector.Detector.FromData(ctx, data.chunk.Verify, matchBytes)
+		elapsed := time.Since(detectorStart)
+		
 		if err != nil {
 			ctx.Logger().Error(err, "error scanning chunk")
 			continue
@@ -1009,21 +1053,29 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 		).Inc()
 		detectorExecutionDuration.WithLabelValues(
 			data.detector.Type().String(),
-		).Observe(float64(time.Since(start).Milliseconds()))
+		).Observe(float64(elapsed.Milliseconds()))
 
-		if e.printAvgDetectorTime && len(results) > 0 {
-			elapsed := time.Since(start)
+		if len(results) > 0 {
 			detectorName := results[0].DetectorType.String()
-			avgTimeI, ok := e.metrics.detectorAvgTime.Load(detectorName)
-			var avgTime []time.Duration
-			if ok {
-				avgTime, ok = avgTimeI.([]time.Duration)
-				if !ok {
-					return
+			
+			// Update average time tracking
+			if e.printAvgDetectorTime {
+				avgTimeI, ok := e.metrics.detectorAvgTime.Load(detectorName)
+				var avgTime []time.Duration
+				if ok {
+					avgTime, ok = avgTimeI.([]time.Duration)
+					if !ok {
+						return
+					}
 				}
+				avgTime = append(avgTime, elapsed)
+				e.metrics.detectorAvgTime.Store(detectorName, avgTime)
 			}
-			avgTime = append(avgTime, elapsed)
-			e.metrics.detectorAvgTime.Store(detectorName, avgTime)
+			
+			// Update detailed profiling metrics
+			if e.detectorProfiling {
+				e.updateDetectorProfiling(detectorName, elapsed)
+			}
 		}
 
 		results = e.filterResults(ctx, data.detector, results)
@@ -1036,6 +1088,36 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 	matchesPerChunk.Observe(float64(matchCount))
 
 	data.wgDoneFn()
+}
+
+// updateDetectorProfiling updates the detailed profiling metrics for a detector
+func (e *Engine) updateDetectorProfiling(detectorName string, elapsed time.Duration) {
+	metricsI, _ := e.metrics.detectorProfiling.LoadOrStore(detectorName, &DetectorMetrics{
+		MinTime: elapsed,
+		MaxTime: elapsed,
+	})
+	
+	metrics := metricsI.(*DetectorMetrics)
+	
+	// Use engine's mutex to ensure thread-safe updates
+	e.metrics.mu.Lock()
+	defer e.metrics.mu.Unlock()
+	
+	// Update metrics
+	metrics.TotalTime += elapsed
+	metrics.CallCount++
+	
+	if elapsed < metrics.MinTime {
+		metrics.MinTime = elapsed
+	}
+	if elapsed > metrics.MaxTime {
+		metrics.MaxTime = elapsed
+	}
+	
+	// Calculate average
+	if metrics.CallCount > 0 {
+		metrics.AvgTime = metrics.TotalTime / time.Duration(metrics.CallCount)
+	}
 }
 
 func (e *Engine) filterResults(
