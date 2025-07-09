@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +97,74 @@ func (s *Source) Init(ctx context.Context, name string, jobId sources.JobID, sou
 		return fmt.Errorf("error unmarshalling connection: %w", err)
 	}
 
+	// Validate configuration
+	if err := s.validateConfig(); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	return nil
+}
+
+// validateConfig validates the DockerHub configuration for common issues
+func (s *Source) validateConfig() error {
+	// Check that we have at least one organization or repository
+	if len(s.conn.Organizations) == 0 && len(s.conn.Repositories) == 0 {
+		return fmt.Errorf("at least one organization or repository must be specified")
+	}
+
+	// Validate max tags is reasonable
+	if s.conn.MaxTags < 0 {
+		return fmt.Errorf("max_tags cannot be negative")
+	}
+	if s.conn.MaxTags > 1000 {
+		// Note: We don't have access to ctx here, so we can't log. This is just a validation check.
+		// Large max_tags values could cause memory issues but will be handled during execution.
+	}
+
+	// Validate repository names
+	for _, repo := range s.conn.Repositories {
+		if err := s.validateRepositoryName(repo); err != nil {
+			return fmt.Errorf("invalid repository name %q: %w", repo, err)
+		}
+	}
+
+	// Validate organization names
+	for _, org := range s.conn.Organizations {
+		if err := s.validateOrganizationName(org); err != nil {
+			return fmt.Errorf("invalid organization name %q: %w", org, err)
+		}
+	}
+
+	return nil
+}
+
+// validateRepositoryName validates a repository name format
+func (s *Source) validateRepositoryName(repo string) error {
+	if repo == "" {
+		return fmt.Errorf("repository name cannot be empty")
+	}
+	if len(repo) > 255 {
+		return fmt.Errorf("repository name too long (max 255 characters)")
+	}
+	// Basic validation for Docker repository name format
+	if strings.Contains(repo, "..") || strings.HasPrefix(repo, "/") || strings.HasSuffix(repo, "/") {
+		return fmt.Errorf("invalid repository name format")
+	}
+	return nil
+}
+
+// validateOrganizationName validates an organization name format
+func (s *Source) validateOrganizationName(org string) error {
+	if org == "" {
+		return fmt.Errorf("organization name cannot be empty")
+	}
+	if len(org) > 255 {
+		return fmt.Errorf("organization name too long (max 255 characters)")
+	}
+	// Basic validation for Docker organization name format
+	if strings.Contains(org, "/") || strings.Contains(org, "..") {
+		return fmt.Errorf("invalid organization name format")
+	}
 	return nil
 }
 
@@ -111,6 +180,12 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 	}
 
 	ctx.Logger().Info("discovered Docker images", "count", len(images))
+
+	// Early return if no images found
+	if len(images) == 0 {
+		ctx.Logger().V(1).Info("no images found to scan")
+		return nil
+	}
 
 	// Scan each discovered image using the existing docker scanner
 	workers := new(errgroup.Group)
@@ -151,12 +226,20 @@ func (s *Source) enumerateImages(ctx context.Context) ([]string, error) {
 	for _, org := range s.conn.Organizations {
 		org := org
 		workers.Go(func() error {
+			if common.IsDone(ctx) {
+				return nil
+			}
+
 			repos, err := s.getRepositoriesForOrganization(ctx, org)
 			if err != nil {
 				return fmt.Errorf("failed to get repositories for org %s: %w", org, err)
 			}
 
 			for _, repo := range repos {
+				if common.IsDone(ctx) {
+					return nil
+				}
+
 				repoName := fmt.Sprintf("%s/%s", org, repo.Name)
 				if s.shouldIncludeRepository(repoName) {
 					images, err := s.getImagesForRepository(ctx, repoName)
@@ -178,6 +261,10 @@ func (s *Source) enumerateImages(ctx context.Context) ([]string, error) {
 	for _, repo := range s.conn.Repositories {
 		repo := repo
 		workers.Go(func() error {
+			if common.IsDone(ctx) {
+				return nil
+			}
+
 			if s.shouldIncludeRepository(repo) {
 				images, err := s.getImagesForRepository(ctx, repo)
 				if err != nil {
@@ -200,17 +287,26 @@ func (s *Source) enumerateImages(ctx context.Context) ([]string, error) {
 }
 
 // shouldIncludeRepository checks if a repository should be included based on include/exclude filters
+// Now uses proper glob pattern matching instead of simple string contains
 func (s *Source) shouldIncludeRepository(repo string) bool {
-	// Check exclude list first
+	// Check exclude list first using glob patterns
 	for _, excludePattern := range s.conn.IgnoreRepos {
+		if matched, _ := filepath.Match(excludePattern, repo); matched {
+			return false
+		}
+		// Fallback to simple string contains for backwards compatibility
 		if strings.Contains(repo, excludePattern) {
 			return false
 		}
 	}
 
-	// If include list is specified, check if repo matches
+	// If include list is specified, check if repo matches using glob patterns
 	if len(s.conn.IncludeRepos) > 0 {
 		for _, includePattern := range s.conn.IncludeRepos {
+			if matched, _ := filepath.Match(includePattern, repo); matched {
+				return true
+			}
+			// Fallback to simple string contains for backwards compatibility
 			if strings.Contains(repo, includePattern) {
 				return true
 			}
@@ -226,8 +322,13 @@ func (s *Source) getRepositoriesForOrganization(ctx context.Context, org string)
 	var allRepos []DockerHubRepository
 	pageSize := 100
 	page := 1
+	maxPages := 100 // Prevent infinite pagination loops
 
-	for {
+	for page <= maxPages {
+		if common.IsDone(ctx) {
+			break
+		}
+
 		url := fmt.Sprintf("https://hub.docker.com/v2/repositories/%s/?page_size=%d&page=%d", 
 			url.QueryEscape(org), pageSize, page)
 
@@ -244,25 +345,50 @@ func (s *Source) getRepositoriesForOrganization(ctx context.Context, org string)
 		if err != nil {
 			return nil, fmt.Errorf("failed to make request: %w", err)
 		}
-		defer resp.Body.Close()
+		
+		// Ensure response body is always closed
+		func() {
+			defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-		}
+			if resp.StatusCode == http.StatusNotFound {
+				// Organization doesn't exist or has no repositories
+				ctx.Logger().V(1).Info("organization not found or has no repositories", "org", org)
+				return
+			}
 
-		var response DockerHubRepositoriesResponse
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			return nil, fmt.Errorf("failed to decode response: %w", err)
-		}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				// Rate limited - could implement backoff here
+				ctx.Logger().V(1).Info("rate limited by DockerHub API", "org", org)
+				return
+			}
 
-		allRepos = append(allRepos, response.Results...)
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024)) // Limit error response size
+				ctx.Logger().Error(fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body)), "failed to get repositories", "org", org)
+				return
+			}
 
-		// Check if there are more pages
-		if response.Next == nil || len(response.Results) == 0 {
-			break
-		}
+			// Limit response size to prevent memory issues
+			limitedReader := io.LimitReader(resp.Body, 10*1024*1024) // 10MB limit
+			var response DockerHubRepositoriesResponse
+			if err := json.NewDecoder(limitedReader).Decode(&response); err != nil {
+				ctx.Logger().Error(err, "failed to decode response", "org", org)
+				return
+			}
+
+			allRepos = append(allRepos, response.Results...)
+
+			// Check if there are more pages
+			if response.Next == nil || len(response.Results) == 0 {
+				return
+			}
+		}()
+
 		page++
+	}
+
+	if page > maxPages {
+		ctx.Logger().V(1).Info("hit maximum page limit for organization", "org", org, "max_pages", maxPages)
 	}
 
 	return allRepos, nil
@@ -277,10 +403,15 @@ func (s *Source) getImagesForRepository(ctx context.Context, repo string) ([]str
 	if maxTags == 0 {
 		maxTags = 100 // default limit
 	}
+	maxPages := 50 // Prevent infinite pagination loops
 
 	tagCount := 0
 
-	for {
+	for page <= maxPages && tagCount < maxTags {
+		if common.IsDone(ctx) {
+			break
+		}
+
 		url := fmt.Sprintf("https://hub.docker.com/v2/repositories/%s/tags/?page_size=%d&page=%d", 
 			url.QueryEscape(repo), pageSize, page)
 
@@ -297,32 +428,68 @@ func (s *Source) getImagesForRepository(ctx context.Context, repo string) ([]str
 		if err != nil {
 			return nil, fmt.Errorf("failed to make request: %w", err)
 		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-		}
+		// Ensure response body is always closed
+		shouldBreak := false
+		func() {
+			defer resp.Body.Close()
 
-		var response DockerHubTagsResponse
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			return nil, fmt.Errorf("failed to decode response: %w", err)
-		}
-
-		for _, tag := range response.Results {
-			if tagCount >= maxTags {
-				return allImages, nil
+			if resp.StatusCode == http.StatusNotFound {
+				ctx.Logger().V(1).Info("repository not found or has no tags", "repo", repo)
+				shouldBreak = true
+				return
 			}
-			
-			imageName := fmt.Sprintf("%s:%s", repo, tag.Name)
-			allImages = append(allImages, imageName)
-			tagCount++
-		}
 
-		// Check if there are more pages and we haven't hit our limit
-		if response.Next == nil || len(response.Results) == 0 || tagCount >= maxTags {
+			if resp.StatusCode == http.StatusTooManyRequests {
+				ctx.Logger().V(1).Info("rate limited by DockerHub API", "repo", repo)
+				shouldBreak = true
+				return
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024)) // Limit error response size
+				ctx.Logger().Error(fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body)), "failed to get tags", "repo", repo)
+				shouldBreak = true
+				return
+			}
+
+			// Limit response size to prevent memory issues
+			limitedReader := io.LimitReader(resp.Body, 10*1024*1024) // 10MB limit
+			var response DockerHubTagsResponse
+			if err := json.NewDecoder(limitedReader).Decode(&response); err != nil {
+				ctx.Logger().Error(err, "failed to decode response", "repo", repo)
+				shouldBreak = true
+				return
+			}
+
+			for _, tag := range response.Results {
+				if tagCount >= maxTags {
+					shouldBreak = true
+					return
+				}
+				
+				// Validate tag name
+				if tag.Name == "" || len(tag.Name) > 128 {
+					ctx.Logger().V(2).Info("skipping invalid tag", "repo", repo, "tag", tag.Name)
+					continue
+				}
+				
+				imageName := fmt.Sprintf("%s:%s", repo, tag.Name)
+				allImages = append(allImages, imageName)
+				tagCount++
+			}
+
+			// Check if there are more pages and we haven't hit our limit
+			if response.Next == nil || len(response.Results) == 0 || tagCount >= maxTags {
+				shouldBreak = true
+				return
+			}
+		}()
+
+		if shouldBreak {
 			break
 		}
+
 		page++
 	}
 
@@ -333,11 +500,19 @@ func (s *Source) getImagesForRepository(ctx context.Context, repo string) ([]str
 func (s *Source) setAuthHeaders(req *http.Request) error {
 	switch cred := s.conn.GetCredential().(type) {
 	case *sourcespb.DockerHub_BasicAuth:
+		if cred.BasicAuth == nil {
+			return fmt.Errorf("basic auth credentials are nil")
+		}
 		req.SetBasicAuth(cred.BasicAuth.Username, cred.BasicAuth.Password)
 	case *sourcespb.DockerHub_Token:
+		if cred.Token == "" {
+			return fmt.Errorf("token is empty")
+		}
 		req.Header.Set("Authorization", "Bearer "+cred.Token)
 	case *sourcespb.DockerHub_Unauthenticated:
 		// No authentication needed
+	case nil:
+		// Default to unauthenticated
 	default:
 		return fmt.Errorf("unknown credential type: %T", s.conn.Credential)
 	}
@@ -346,6 +521,11 @@ func (s *Source) setAuthHeaders(req *http.Request) error {
 
 // scanImage uses the existing docker scanner to scan a specific image
 func (s *Source) scanImage(ctx context.Context, imageName string, chunksChan chan *sources.Chunk) error {
+	// Validate image name
+	if imageName == "" {
+		return fmt.Errorf("image name cannot be empty")
+	}
+
 	// Create a docker connection configuration for this specific image
 	dockerConn := &sourcespb.Docker{
 		Images: []string{imageName},
@@ -354,17 +534,22 @@ func (s *Source) scanImage(ctx context.Context, imageName string, chunksChan cha
 	// Set authentication based on our DockerHub credentials
 	switch cred := s.conn.GetCredential().(type) {
 	case *sourcespb.DockerHub_BasicAuth:
-		dockerConn.Credential = &sourcespb.Docker_BasicAuth{
-			BasicAuth: cred.BasicAuth,
+		if cred.BasicAuth != nil {
+			dockerConn.Credential = &sourcespb.Docker_BasicAuth{
+				BasicAuth: cred.BasicAuth,
+			}
 		}
 	case *sourcespb.DockerHub_Token:
-		dockerConn.Credential = &sourcespb.Docker_BearerToken{
-			BearerToken: cred.Token,
+		if cred.Token != "" {
+			dockerConn.Credential = &sourcespb.Docker_BearerToken{
+				BearerToken: cred.Token,
+			}
 		}
 	case *sourcespb.DockerHub_Unauthenticated:
 		dockerConn.Credential = &sourcespb.Docker_Unauthenticated{}
 	default:
-		return fmt.Errorf("unknown credential type: %T", s.conn.Credential)
+		// Default to unauthenticated for unknown types
+		dockerConn.Credential = &sourcespb.Docker_Unauthenticated{}
 	}
 
 	// Marshall the docker connection
