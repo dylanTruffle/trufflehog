@@ -152,6 +152,16 @@ var (
 	dockerScanImages = dockerScan.Flag("image", "Docker image to scan. Use the file:// prefix to point to a local tarball, otherwise a image registry is assumed.").Required().Strings()
 	dockerScanToken  = dockerScan.Flag("token", "Docker bearer token. Can also be provided with environment variable").Envar("DOCKER_TOKEN").String()
 
+	dockerhubScan             = cli.Command("dockerhub", "Scan DockerHub for images")
+	dockerhubScanOrgs         = dockerhubScan.Flag("org", "DockerHub organization to scan. You can repeat this flag.").Strings()
+	dockerhubScanRepos        = dockerhubScan.Flag("repo", "DockerHub repository to scan. You can repeat this flag.").Strings()
+	dockerhubScanIgnoreRepos  = dockerhubScan.Flag("ignore-repo", "DockerHub repository to ignore. You can repeat this flag.").Strings()
+	dockerhubScanIncludeRepos = dockerhubScan.Flag("include-repo", "DockerHub repository to include. You can repeat this flag.").Strings()
+	dockerhubScanMaxTags      = dockerhubScan.Flag("max-tags", "Maximum number of tags to scan per repository.").Default("10").Int32()
+	dockerhubScanUsername     = dockerhubScan.Flag("username", "DockerHub username for authentication").Envar("DOCKERHUB_USERNAME").String()
+	dockerhubScanPassword     = dockerhubScan.Flag("password", "DockerHub password for authentication").Envar("DOCKERHUB_PASSWORD").String()
+	dockerhubScanToken        = dockerhubScan.Flag("token", "DockerHub token for authentication").Envar("DOCKERHUB_TOKEN").String()
+
 	travisCiScan      = cli.Command("travisci", "Scan TravisCI")
 	travisCiScanToken = travisCiScan.Flag("token", "TravisCI token. Can also be provided with environment variable").Envar("TRAVISCI_TOKEN").Required().String()
 
@@ -674,6 +684,23 @@ func runSingleScan(ctx context.Context, cmd string, cfg engine.Config) (metrics,
 		}
 		if err := eng.ScanDocker(ctx, cfg); err != nil {
 			return scanMetrics, fmt.Errorf("failed to scan Docker: %v", err)
+		}
+	case dockerhubScan.FullCommand():
+		if len(*dockerhubScanOrgs) == 0 && len(*dockerhubScanRepos) == 0 {
+			return scanMetrics, fmt.Errorf("invalid config: you must specify at least one organization or repository")
+		}
+		cfg := engine.DockerHubConfig{
+			Organizations: *dockerhubScanOrgs,
+			Repositories:  *dockerhubScanRepos,
+			IgnoreRepos:   *dockerhubScanIgnoreRepos,
+			IncludeRepos:  *dockerhubScanIncludeRepos,
+			MaxTags:       *dockerhubScanMaxTags,
+			Username:      *dockerhubScanUsername,
+			Password:      *dockerhubScanPassword,
+			Token:         *dockerhubScanToken,
+		}
+		if err := eng.ScanDockerHub(ctx, cfg); err != nil {
+			return scanMetrics, fmt.Errorf("failed to scan DockerHub: %v", err)
 		}
 	case postmanScan.FullCommand():
 		// handle deprecated flag
