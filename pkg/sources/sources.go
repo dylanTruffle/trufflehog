@@ -154,6 +154,26 @@ type DockerConfig struct {
 	UseDockerKeychain bool
 }
 
+// DockerHubConfig defines the optional configuration for a DockerHub source.
+type DockerHubConfig struct {
+	// Organizations is the list of organizations to scan.
+	Organizations []string
+	// Repositories is the list of repositories to scan.
+	Repositories []string
+	// IgnoreRepos is a list of repositories to exclude from the scan.
+	IgnoreRepos []string
+	// IncludeRepos is a list of repositories to include in the scan.
+	IncludeRepos []string
+	// MaxTags is the maximum number of tags to scan per repository.
+	MaxTags int32
+	// Username is the username to use to authenticate with the source.
+	Username string
+	// Password is the password to use to authenticate with the source.
+	Password string
+	// Token is the token to use to authenticate with the source.
+	Token string
+}
+
 // GCSConfig defines the optional configuration for a GCS source.
 type GCSConfig struct {
 	// CloudCred determines whether to use cloud credentials.

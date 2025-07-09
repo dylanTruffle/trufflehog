@@ -64,6 +64,7 @@ const (
 	SourceType_SOURCE_TYPE_POSTMAN                    SourceType = 33
 	SourceType_SOURCE_TYPE_WEBHOOK                    SourceType = 34
 	SourceType_SOURCE_TYPE_ELASTICSEARCH              SourceType = 35
+	SourceType_SOURCE_TYPE_DOCKERHUB                  SourceType = 36
 )
 
 // Enum value maps for SourceType.
@@ -105,6 +106,7 @@ var (
 		33: "SOURCE_TYPE_POSTMAN",
 		34: "SOURCE_TYPE_WEBHOOK",
 		35: "SOURCE_TYPE_ELASTICSEARCH",
+		36: "SOURCE_TYPE_DOCKERHUB",
 	}
 	SourceType_value = map[string]int32{
 		"SOURCE_TYPE_AZURE_STORAGE":              0,
@@ -143,6 +145,7 @@ var (
 		"SOURCE_TYPE_POSTMAN":                    33,
 		"SOURCE_TYPE_WEBHOOK":                    34,
 		"SOURCE_TYPE_ELASTICSEARCH":              35,
+		"SOURCE_TYPE_DOCKERHUB":                  36,
 	}
 )
 
@@ -3895,6 +3898,141 @@ func (x *Elasticsearch) GetBestEffortScan() bool {
 	}
 	return false
 }
+
+type DockerHub struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	// Types that are assignable to Credential:
+	//
+	//	*DockerHub_Unauthenticated
+	//	*DockerHub_BasicAuth
+	//	*DockerHub_Token
+	Credential   isDockerHub_Credential `protobuf_oneof:"credential"`
+	Organizations []string             `protobuf:"bytes,4,rep,name=organizations,proto3" json:"organizations,omitempty"`
+	Repositories []string             `protobuf:"bytes,5,rep,name=repositories,proto3" json:"repositories,omitempty"`
+	IgnoreRepos  []string             `protobuf:"bytes,6,rep,name=ignore_repos,json=ignoreRepos,proto3" json:"ignore_repos,omitempty"`
+	IncludeRepos []string             `protobuf:"bytes,7,rep,name=include_repos,json=includeRepos,proto3" json:"include_repos,omitempty"`
+	MaxTags      int32                `protobuf:"varint,8,opt,name=max_tags,json=maxTags,proto3" json:"max_tags,omitempty"`
+}
+
+func (x *DockerHub) Reset() {
+	*x = DockerHub{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_sources_proto_msgTypes[32]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *DockerHub) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DockerHub) ProtoMessage() {}
+
+func (x *DockerHub) ProtoReflect() protoreflect.Message {
+	mi := &file_sources_proto_msgTypes[32]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DockerHub.ProtoReflect.Descriptor instead.
+func (*DockerHub) Descriptor() ([]byte, []int) {
+	return file_sources_proto_rawDescGZIP(), []int{32}
+}
+
+func (m *DockerHub) GetCredential() isDockerHub_Credential {
+	if m != nil {
+		return m.Credential
+	}
+	return nil
+}
+
+func (x *DockerHub) GetUnauthenticated() *credentialspb.Unauthenticated {
+	if x, ok := x.GetCredential().(*DockerHub_Unauthenticated); ok {
+		return x.Unauthenticated
+	}
+	return nil
+}
+
+func (x *DockerHub) GetBasicAuth() *credentialspb.BasicAuth {
+	if x, ok := x.GetCredential().(*DockerHub_BasicAuth); ok {
+		return x.BasicAuth
+	}
+	return nil
+}
+
+func (x *DockerHub) GetToken() string {
+	if x, ok := x.GetCredential().(*DockerHub_Token); ok {
+		return x.Token
+	}
+	return ""
+}
+
+func (x *DockerHub) GetOrganizations() []string {
+	if x != nil {
+		return x.Organizations
+	}
+	return nil
+}
+
+func (x *DockerHub) GetRepositories() []string {
+	if x != nil {
+		return x.Repositories
+	}
+	return nil
+}
+
+func (x *DockerHub) GetIgnoreRepos() []string {
+	if x != nil {
+		return x.IgnoreRepos
+	}
+	return nil
+}
+
+func (x *DockerHub) GetIncludeRepos() []string {
+	if x != nil {
+		return x.IncludeRepos
+	}
+	return nil
+}
+
+func (x *DockerHub) GetMaxTags() int32 {
+	if x != nil {
+		return x.MaxTags
+	}
+	return 0
+}
+
+type isDockerHub_Credential interface {
+	isDockerHub_Credential()
+}
+
+type DockerHub_Unauthenticated struct {
+	Unauthenticated *credentialspb.Unauthenticated `protobuf:"bytes,1,opt,name=unauthenticated,proto3,oneof"`
+}
+
+type DockerHub_BasicAuth struct {
+	BasicAuth *credentialspb.BasicAuth `protobuf:"bytes,2,opt,name=basic_auth,json=basicAuth,proto3,oneof"`
+}
+
+type DockerHub_Token struct {
+	Token string `protobuf:"bytes,3,opt,name=token,proto3,oneof"`
+}
+
+func (*DockerHub_Unauthenticated) isDockerHub_Credential() {}
+
+func (*DockerHub_BasicAuth) isDockerHub_Credential() {}
+
+func (*DockerHub_Token) isDockerHub_Credential() {}
 
 var File_sources_proto protoreflect.FileDescriptor
 
