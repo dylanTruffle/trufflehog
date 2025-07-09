@@ -32,6 +32,7 @@ type Source struct {
 	concurrency int
 	conn        sourcespb.DockerHub
 	httpClient  *http.Client
+	sharedCache *docker.LayerCache
 	
 	sources.Progress
 	sources.CommonSourceUnitUnmarshaller
@@ -92,6 +93,11 @@ func (s *Source) Init(ctx context.Context, name string, jobId sources.JobID, sou
 	s.verify = verify
 	s.concurrency = concurrency
 	s.httpClient = common.RetryableHTTPClientTimeout(60)
+	
+	// Initialize shared cache for all images in this dockerhub scan
+	s.sharedCache = docker.NewLayerCache(5000)
+	// Temporarily disable cache for baseline comparison
+	// s.sharedCache.SetEnabled(false)
 
 	if err := anypb.UnmarshalTo(connection, &s.conn, proto.UnmarshalOptions{}); err != nil {
 		return fmt.Errorf("error unmarshalling connection: %w", err)
@@ -209,6 +215,22 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 	_ = workers.Wait()
 	if scanErrs.Count() > 0 {
 		ctx.Logger().V(2).Info("scan errors", "errors", scanErrs.String())
+	}
+
+	// Log overall cache statistics for the dockerhub scan
+	if s.sharedCache != nil {
+		hits, misses, size := s.sharedCache.GetStats()
+		totalRequests := hits + misses
+		hitRate := float64(0)
+		if totalRequests > 0 {
+			hitRate = float64(hits) / float64(totalRequests) * 100.0
+		}
+		ctx.Logger().Info("DockerHub scan cache statistics", 
+			"total_images", len(images),
+			"cache_hits", hits, 
+			"cache_misses", misses, 
+			"cache_size", size, 
+			"hit_rate_percent", hitRate)
 	}
 
 	return nil
@@ -564,6 +586,9 @@ func (s *Source) scanImage(ctx context.Context, imageName string, chunksChan cha
 	if err := dockerSource.Init(ctx, sourceName, s.jobId, s.sourceId, s.verify, &conn, 1); err != nil {
 		return fmt.Errorf("failed to initialize docker source: %w", err)
 	}
+
+	// Set the shared cache for this scan
+	dockerSource.SetLayerCache(s.sharedCache)
 
 	// Scan the image
 	return dockerSource.Chunks(ctx, chunksChan)

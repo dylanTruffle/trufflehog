@@ -33,6 +33,7 @@ type Source struct {
 	verify      bool
 	concurrency int
 	conn        sourcespb.Docker
+	layerCache  *LayerCache
 	sources.Progress
 	sources.CommonSourceUnitUnmarshaller
 }
@@ -63,6 +64,9 @@ func (s *Source) Init(_ context.Context, name string, jobId sources.JobID, sourc
 	s.verify = verify
 	s.concurrency = concurrency
 
+	// Initialize layer cache with a reasonable size
+	s.layerCache = NewLayerCache(1000)
+
 	// Reset metrics for this source at initialization time.
 	dockerImagesScanned.WithLabelValues(s.name).Set(0)
 	dockerLayersScanned.WithLabelValues(s.name).Set(0)
@@ -72,6 +76,11 @@ func (s *Source) Init(_ context.Context, name string, jobId sources.JobID, sourc
 	}
 
 	return nil
+}
+
+// SetLayerCache sets the layer cache for this source (used for sharing cache across sources)
+func (s *Source) SetLayerCache(cache *LayerCache) {
+	s.layerCache = cache
 }
 
 type imageInfo struct {
@@ -157,6 +166,16 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 	_ = workers.Wait()
 	if scanErrs.Count() > 0 {
 		ctx.Logger().V(2).Info("scan errors", "errors", scanErrs.String())
+	}
+
+	// Log cache statistics
+	if s.layerCache != nil {
+		hits, misses, size := s.layerCache.GetStats()
+		ctx.Logger().Info("layer cache statistics", 
+			"hits", hits, 
+			"misses", misses, 
+			"size", size, 
+			"hit_rate", float64(hits)/float64(hits+misses)*100.0)
 	}
 
 	return nil
@@ -301,14 +320,61 @@ func (s *Source) processLayer(ctx context.Context, layer v1.Layer, imgInfo image
 
 	ctx.Logger().WithValues("layer", layerInfo.digest.String()).V(2).Info("scanning layer")
 
+	// Check if this layer is already cached
+	if cachedResult, found := s.layerCache.Get(layerInfo.digest); found {
+		ctx.Logger().WithValues("layer", layerInfo.digest.String()).V(2).Info("layer found in cache, using cached results")
+		
+		// Send cached chunks to the output channel
+		for _, chunk := range cachedResult.Chunks {
+			// Create a copy of the chunk with updated metadata for this specific image
+			chunkCopy := &sources.Chunk{
+				SourceType:     chunk.SourceType,
+				SourceName:     chunk.SourceName,
+				SourceID:       chunk.SourceID,
+				SourceMetadata: chunk.SourceMetadata,
+				Verify:         chunk.Verify,
+				Data:           chunk.Data,
+			}
+			
+			// Update the image and tag in the metadata
+			if dockerMeta := chunkCopy.SourceMetadata.GetDocker(); dockerMeta != nil {
+				dockerMeta.Image = imgInfo.base
+				dockerMeta.Tag = imgInfo.tag
+				// Keep the same layer digest and file path
+			}
+			
+			if err := common.CancellableWrite(ctx, chunksChan, chunkCopy); err != nil {
+				return err
+			}
+		}
+		
+		return cachedResult.Error
+	}
+
+	ctx.Logger().WithValues("layer", layerInfo.digest.String()).V(2).Info("layer not in cache, scanning")
+
+	// Layer not cached, scan it and store the results
+	var chunks []*sources.Chunk
+	var scanError error
+
 	rc, err := layer.Compressed()
 	if err != nil {
+		scanError = err
+		s.layerCache.Set(layerInfo.digest, &LayerScanResult{
+			Chunks: chunks,
+			Error:  scanError,
+		})
 		return err
 	}
 	defer rc.Close()
 
 	gzipReader, err := gzip.NewReader(rc)
 	if err != nil {
+		scanError = err
+		s.layerCache.Set(layerInfo.digest, &LayerScanResult{
+			Chunks: chunks,
+			Error:  scanError,
+		})
 		return err
 	}
 	defer gzipReader.Close()
@@ -320,16 +386,40 @@ func (s *Source) processLayer(ctx context.Context, layer v1.Layer, imgInfo image
 			break
 		}
 		if err != nil {
-			return err
+			scanError = err
+			break
 		}
 
 		info := chunkProcessingInfo{size: header.Size, name: header.Name, reader: tarReader, layer: layerInfo}
-		if err := s.processChunk(ctx, info, chunksChan); err != nil {
-			return err
+		
+		// Process the chunk and collect results
+		fileChunks, err := s.processChunkForCache(ctx, info)
+		if err != nil {
+			scanError = err
+			break
+		}
+		
+		// Add chunks to our collection and send to output
+		for _, chunk := range fileChunks {
+			chunks = append(chunks, chunk)
+			if err := common.CancellableWrite(ctx, chunksChan, chunk); err != nil {
+				scanError = err
+				break
+			}
+		}
+
+		if scanError != nil {
+			break
 		}
 	}
 
-	return nil
+	// Cache the results
+	s.layerCache.Set(layerInfo.digest, &LayerScanResult{
+		Chunks: chunks,
+		Error:  scanError,
+	})
+
+	return scanError
 }
 
 type chunkProcessingInfo struct {
@@ -380,6 +470,47 @@ func (s *Source) processChunk(ctx context.Context, info chunkProcessingInfo, chu
 	}
 
 	return nil
+}
+
+// processChunkForCache processes a chunk and returns all chunks as a slice for caching
+func (s *Source) processChunkForCache(ctx context.Context, info chunkProcessingInfo) ([]*sources.Chunk, error) {
+	const filesizeLimitBytes int64 = 50 * 1024 * 1024 // 50MB
+	if info.size > filesizeLimitBytes {
+		ctx.Logger().V(4).Info("skipping large file", "file", info.name, "size", info.size)
+		return nil, nil
+	}
+
+	var chunks []*sources.Chunk
+	chunkReader := sources.NewChunkReader()
+	chunkResChan := chunkReader(ctx, info.reader)
+
+	for data := range chunkResChan {
+		if err := data.Error(); err != nil {
+			ctx.Logger().Error(err, "error reading chunk.")
+			continue
+		}
+
+		chunk := &sources.Chunk{
+			SourceType: s.Type(),
+			SourceName: s.name,
+			SourceID:   s.SourceID(),
+			SourceMetadata: &source_metadatapb.MetaData{
+				Data: &source_metadatapb.MetaData_Docker{
+					Docker: &source_metadatapb.Docker{
+						File:  "/" + info.name,
+						Image: info.layer.base,
+						Tag:   info.layer.tag,
+						Layer: info.layer.digest.String(),
+					},
+				},
+			},
+			Verify: s.verify,
+		}
+		chunk.Data = data.Bytes()
+		chunks = append(chunks, chunk)
+	}
+
+	return chunks, nil
 }
 
 func (s *Source) remoteOpts() ([]remote.Option, error) {
