@@ -3,7 +3,7 @@
 ## API & Network Edge Cases
 
 ### 1. Rate Limiting & Authentication
-- ⚠️ **Rate limit exceeded (429 responses)** - Detected and logged, but no retry/backoff
+- ✅ **Rate limit exceeded (429 responses)** - Comprehensive handling with exponential backoff and retry logic
 - ✅ **Invalid authentication credentials** - Properly handled with clear error messages
 - ❌ **Token expiration during scan** - No token refresh mechanism
 - ✅ **Mixed public/private repositories with auth** - Handled via credential passthrough to Docker scanner
@@ -178,8 +178,8 @@
 
 ## Summary
 
-### ✅ **Verified (67 items)** - Properly handled
-### ⚠️ **Partial (8 items)** - Some handling, could be improved
+### ✅ **Verified (68 items)** - Properly handled
+### ⚠️ **Partial (7 items)** - Some handling, could be improved
 ### ❌ **Missing (7 items)** - Needs implementation
 ### Total: 82 edge cases checked
 

@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +25,13 @@ import (
 )
 
 const SourceType = sourcespb.SourceType_SOURCE_TYPE_DOCKERHUB
+
+// Global rate limit state to coordinate across all goroutines
+var (
+	rateLimitMu         sync.RWMutex
+	rateLimitResumeTime time.Time
+	rateLimitResetTime  time.Time
+)
 
 type Source struct {
 	name        string
@@ -83,6 +92,160 @@ type DockerHubTagsResponse struct {
 	Next     *string        `json:"next"`
 	Previous *string        `json:"previous"`
 	Results  []DockerHubTag `json:"results"`
+}
+
+// handleRateLimit handles DockerHub API rate limits with exponential backoff
+// Returns true if a rate limit was handled and the request should be retried
+func (s *Source) handleRateLimit(ctx context.Context, resp *http.Response) bool {
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return false
+	}
+
+	rateLimitMu.RLock()
+	resumeTime := rateLimitResumeTime
+	rateLimitMu.RUnlock()
+
+	var retryAfter time.Duration
+	now := time.Now()
+
+	// Check if we're already in a rate limit period
+	if !resumeTime.IsZero() && now.Before(resumeTime) {
+		retryAfter = time.Until(resumeTime)
+		ctx.Logger().V(1).Info("DockerHub rate limit in progress", 
+			"retry_after", retryAfter.String(), 
+			"resume_time", resumeTime.Format(time.RFC3339))
+	} else {
+		// Parse Retry-After header if present
+		retryAfter = s.parseRetryAfter(resp)
+		
+		// If no Retry-After header, use exponential backoff
+		if retryAfter == 0 {
+			// DockerHub rate limits reset every 6 hours for anonymous users
+			// Use exponential backoff with a reasonable maximum
+			baseDelay := 2 * time.Minute
+			maxDelay := 30 * time.Minute
+			
+			// Add jitter to prevent thundering herd
+			jitter := time.Duration(rand.Intn(30)+10) * time.Second
+			retryAfter = baseDelay + jitter
+			
+			// Don't exceed max delay
+			if retryAfter > maxDelay {
+				retryAfter = maxDelay
+			}
+		}
+
+		rateLimitMu.Lock()
+		rateLimitResumeTime = now.Add(retryAfter)
+		// DockerHub rate limits typically reset every 6 hours
+		rateLimitResetTime = now.Add(6 * time.Hour)
+		rateLimitMu.Unlock()
+
+		ctx.Logger().V(0).Info("DockerHub rate limit detected", 
+			"retry_after", retryAfter.String(), 
+			"resume_time", rateLimitResumeTime.Format(time.RFC3339),
+			"estimated_reset", rateLimitResetTime.Format(time.RFC3339))
+	}
+
+	// Sleep for the retry duration
+	if retryAfter > 0 {
+		ctx.Logger().V(1).Info("Waiting for DockerHub rate limit to clear", 
+			"wait_duration", retryAfter.String())
+		
+		// Use a timer to allow for context cancellation
+		timer := time.NewTimer(retryAfter)
+		defer timer.Stop()
+		
+		select {
+		case <-ctx.Done():
+			ctx.Logger().V(1).Info("Context cancelled while waiting for rate limit")
+			return false
+		case <-timer.C:
+			ctx.Logger().V(1).Info("Rate limit wait period completed, retrying request")
+		}
+	}
+
+	return true
+}
+
+// parseRetryAfter extracts the retry delay from the Retry-After header
+func (s *Source) parseRetryAfter(resp *http.Response) time.Duration {
+	retryAfterHeader := resp.Header.Get("Retry-After")
+	if retryAfterHeader == "" {
+		return 0
+	}
+
+	// Try parsing as seconds (RFC 7231)
+	if seconds, err := strconv.ParseInt(retryAfterHeader, 10, 64); err == nil {
+		if seconds > 0 && seconds < 3600 { // Max 1 hour
+			return time.Duration(seconds) * time.Second
+		}
+	}
+
+	// Try parsing as HTTP date (RFC 7231)
+	if retryTime, err := http.ParseTime(retryAfterHeader); err == nil {
+		duration := time.Until(retryTime)
+		if duration > 0 && duration < time.Hour {
+			return duration
+		}
+	}
+
+	return 0
+}
+
+// makeRequestWithRetry makes an HTTP request with rate limit handling and retries
+func (s *Source) makeRequestWithRetry(ctx context.Context, req *http.Request, maxRetries int) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+	
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if common.IsDone(ctx) {
+			return nil, ctx.Err()
+		}
+
+		resp, err = s.httpClient.Do(req)
+		if err != nil {
+			// Network error - use exponential backoff
+			if attempt < maxRetries {
+				backoff := time.Duration(1<<attempt) * time.Second
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				ctx.Logger().V(2).Info("Network error, retrying", 
+					"attempt", attempt+1, 
+					"max_attempts", maxRetries+1, 
+					"backoff", backoff.String(), 
+					"error", err)
+				
+				timer := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, ctx.Err()
+				case <-timer.C:
+					continue
+				}
+			}
+			return nil, fmt.Errorf("request failed after %d attempts: %w", maxRetries+1, err)
+		}
+
+		// Check for rate limiting
+		if s.handleRateLimit(ctx, resp) {
+			resp.Body.Close() // Close the response body before retry
+			if attempt < maxRetries {
+				ctx.Logger().V(2).Info("Rate limit handled, retrying request", 
+					"attempt", attempt+1, 
+					"max_attempts", maxRetries+1)
+				continue
+			}
+			return nil, fmt.Errorf("rate limit exceeded after %d attempts", maxRetries+1)
+		}
+
+		// Request successful
+		break
+	}
+
+	return resp, nil
 }
 
 // Init initializes the source.
@@ -363,24 +526,19 @@ func (s *Source) getRepositoriesForOrganization(ctx context.Context, org string)
 			return nil, fmt.Errorf("failed to set auth headers: %w", err)
 		}
 
-		resp, err := s.httpClient.Do(req)
+		resp, err := s.makeRequestWithRetry(ctx, req, 3)
 		if err != nil {
 			return nil, fmt.Errorf("failed to make request: %w", err)
 		}
 		
 		// Ensure response body is always closed
+		shouldContinue := false
 		func() {
 			defer resp.Body.Close()
 
 			if resp.StatusCode == http.StatusNotFound {
 				// Organization doesn't exist or has no repositories
 				ctx.Logger().V(1).Info("organization not found or has no repositories", "org", org)
-				return
-			}
-
-			if resp.StatusCode == http.StatusTooManyRequests {
-				// Rate limited - could implement backoff here
-				ctx.Logger().V(1).Info("rate limited by DockerHub API", "org", org)
 				return
 			}
 
@@ -401,10 +559,14 @@ func (s *Source) getRepositoriesForOrganization(ctx context.Context, org string)
 			allRepos = append(allRepos, response.Results...)
 
 			// Check if there are more pages
-			if response.Next == nil || len(response.Results) == 0 {
-				return
+			if response.Next != nil && len(response.Results) > 0 {
+				shouldContinue = true
 			}
 		}()
+
+		if !shouldContinue {
+			break
+		}
 
 		page++
 	}
@@ -446,7 +608,7 @@ func (s *Source) getImagesForRepository(ctx context.Context, repo string) ([]str
 			return nil, fmt.Errorf("failed to set auth headers: %w", err)
 		}
 
-		resp, err := s.httpClient.Do(req)
+		resp, err := s.makeRequestWithRetry(ctx, req, 3)
 		if err != nil {
 			return nil, fmt.Errorf("failed to make request: %w", err)
 		}
@@ -458,12 +620,6 @@ func (s *Source) getImagesForRepository(ctx context.Context, repo string) ([]str
 
 			if resp.StatusCode == http.StatusNotFound {
 				ctx.Logger().V(1).Info("repository not found or has no tags", "repo", repo)
-				shouldBreak = true
-				return
-			}
-
-			if resp.StatusCode == http.StatusTooManyRequests {
-				ctx.Logger().V(1).Info("rate limited by DockerHub API", "repo", repo)
 				shouldBreak = true
 				return
 			}

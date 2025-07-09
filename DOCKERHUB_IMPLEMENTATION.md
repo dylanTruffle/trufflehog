@@ -107,8 +107,15 @@ trufflehog dockerhub --orgs "myorg" --include-repos "prod-" --ignore-repos "test
 
 ### Rate Limiting
 - DockerHub API has rate limits (100 requests/6 hours for anonymous users)
-- Authenticated users get higher rate limits
-- Implementation includes retry logic and error handling
+- Authenticated users get higher rate limits (200 requests/6 hours for free tier)
+- **Comprehensive rate limit handling implemented:**
+  - Automatic detection of HTTP 429 responses
+  - Respect for `Retry-After` headers from DockerHub API
+  - Exponential backoff with jitter to prevent thundering herd
+  - Global rate limit state coordination across concurrent requests
+  - Context-aware waiting with cancellation support
+  - Automatic retry with configurable maximum attempts
+  - Detailed logging of rate limit events and timing
 
 ### Performance
 - Uses concurrent goroutines for repository enumeration
