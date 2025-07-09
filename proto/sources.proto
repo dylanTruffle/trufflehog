@@ -48,6 +48,7 @@ enum SourceType {
   SOURCE_TYPE_POSTMAN = 33;
   SOURCE_TYPE_WEBHOOK = 34;
   SOURCE_TYPE_ELASTICSEARCH = 35;
+  SOURCE_TYPE_DOCKERHUB = 36;
 }
 
 message LocalSource {
@@ -421,4 +422,17 @@ message Elasticsearch {
   string query_json = 8;
   string since_timestamp = 9;
   bool best_effort_scan = 10;
+}
+
+message DockerHub {
+  oneof credential {
+    credentials.Unauthenticated unauthenticated = 1;
+    credentials.BasicAuth basic_auth = 2;
+    string token = 3;
+  }
+  repeated string organizations = 4;
+  repeated string repositories = 5;
+  repeated string ignore_repos = 6;
+  repeated string include_repos = 7;
+  int32 max_tags = 8;
 }
