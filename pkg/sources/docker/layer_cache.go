@@ -5,7 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/trufflesecurity/trufflehog/v3/pkg/cache/memory"
+	lru "github.com/hashicorp/golang-lru/v2"
+
 	"github.com/trufflesecurity/trufflehog/v3/pkg/sources"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
@@ -19,7 +20,7 @@ type LayerScanResult struct {
 
 // LayerCache provides caching for Docker layer scan results
 type LayerCache struct {
-	cache   *memory.Cache[*LayerScanResult]
+	cache   *lru.Cache[string, *LayerScanResult]
 	hits    int64 // accessed atomically
 	misses  int64 // accessed atomically
 	mu      sync.RWMutex
@@ -30,14 +31,14 @@ type LayerCache struct {
 // NewLayerCache creates a new layer cache with the specified maximum size
 func NewLayerCache(maxSize int) *LayerCache {
 	if maxSize <= 0 {
-		maxSize = 1000 // Default cache size
+		maxSize = 1000 // sensible default
 	}
-	
+
+	// lru.New never returns error for size > 0
+	lruCache, _ := lru.New[string, *LayerScanResult](maxSize)
+
 	return &LayerCache{
-		cache:   memory.New[*LayerScanResult](
-			memory.WithExpirationInterval[*LayerScanResult](1 * time.Hour),
-			memory.WithPurgeInterval[*LayerScanResult](1 * time.Hour),
-		),
+		cache:   lruCache,
 		maxSize: maxSize,
 		enabled: true,
 	}
@@ -48,6 +49,9 @@ func (lc *LayerCache) Get(digest v1.Hash) (*LayerScanResult, bool) {
 	if !lc.enabled {
 		return nil, false
 	}
+
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
 
 	result, found := lc.cache.Get(digest.String())
 	if found {
@@ -68,33 +72,22 @@ func (lc *LayerCache) Set(digest v1.Hash, result *LayerScanResult) {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 
-	// Check if we need to evict old entries to stay under the size limit
-	if lc.cache.Count() >= lc.maxSize {
-		// Simple eviction strategy: remove the oldest entries
-		// This is a basic implementation - could be improved with LRU
-		keys := lc.cache.Keys()
-		if len(keys) > 0 {
-			lc.cache.Delete(keys[0])
-		}
-	}
-
 	result.Timestamp = time.Now()
-	lc.cache.Set(digest.String(), result)
+	lc.cache.Add(digest.String(), result)
 }
 
 // GetStats returns cache statistics
 func (lc *LayerCache) GetStats() (hits, misses int64, size int) {
 	hits = atomic.LoadInt64(&lc.hits)
 	misses = atomic.LoadInt64(&lc.misses)
-	size = lc.cache.Count()
-	return
+	return hits, misses, lc.cache.Len()
 }
 
 // Clear removes all cached entries
 func (lc *LayerCache) Clear() {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
-	lc.cache.Clear()
+	lc.cache.Purge()
 	atomic.StoreInt64(&lc.hits, 0)
 	atomic.StoreInt64(&lc.misses, 0)
 }
