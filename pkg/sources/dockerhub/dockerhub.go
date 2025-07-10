@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -342,43 +343,52 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 	ctx = context.WithValue(ctx, "source_type", s.Type())
 	ctx = context.WithValue(ctx, "source_name", s.name)
 
-	// Discover all repositories and tags
-	images, err := s.enumerateImages(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to enumerate images: %w", err)
-	}
+	// Channel for streaming image names from enumeration to scanners
+	imageChan := make(chan string, 100)
 
-	ctx.Logger().Info("discovered Docker images", "count", len(images))
+	// Group to enumerate images concurrently
+	enumGroup, scanGroup := new(errgroup.Group), new(errgroup.Group)
+	enumGroup.SetLimit(s.concurrency)
+	scanGroup.SetLimit(s.concurrency)
 
-	// Early return if no images found
-	if len(images) == 0 {
-		ctx.Logger().V(1).Info("no images found to scan")
-		return nil
-	}
+	// Counter for logging
+	var imageCount int64
 
-	// Scan each discovered image using the existing docker scanner
-	workers := new(errgroup.Group)
-	workers.SetLimit(s.concurrency)
+	// Start enumeration in separate goroutine so scanning can start immediately
+	enumGroup.Go(func() error {
+		defer close(imageChan)
+		return s.enumerateImagesStream(ctx, imageChan)
+	})
 
-	scanErrs := sources.NewScanErrors()
-	for _, image := range images {
-		image := image
-		workers.Go(func() error {
-			if common.IsDone(ctx) {
-				return nil
+	// Start scanner workers that read from imageChan
+	for i := 0; i < s.concurrency; i++ {
+		scanGroup.Go(func() error {
+			scanErrs := sources.NewScanErrors()
+			for image := range imageChan {
+				if common.IsDone(ctx) {
+					break
+				}
+				if err := s.scanImage(ctx, image, chunksChan); err != nil {
+					scanErrs.Add(fmt.Errorf("failed to scan image %s: %w", image, err))
+				}
+				atomic.AddInt64(&imageCount, 1)
 			}
-
-			if err := s.scanImage(ctx, image, chunksChan); err != nil {
-				scanErrs.Add(fmt.Errorf("failed to scan image %s: %w", image, err))
+			if scanErrs.Count() > 0 {
+				return fmt.Errorf("scan errors: %s", scanErrs.String())
 			}
 			return nil
 		})
 	}
 
-	_ = workers.Wait()
-	if scanErrs.Count() > 0 {
-		ctx.Logger().V(2).Info("scan errors", "errors", scanErrs.String())
+	// Wait for both enumeration and scanning to complete
+	if err := enumGroup.Wait(); err != nil {
+		return fmt.Errorf("failed to enumerate images: %w", err)
 	}
+	if err := scanGroup.Wait(); err != nil {
+		ctx.Logger().V(2).Info("errors during scanning", "error", err)
+	}
+
+	ctx.Logger().Info("scanned Docker images", "count", imageCount)
 
 	// Log overall cache statistics for the dockerhub scan
 	if s.sharedCache != nil {
@@ -389,7 +399,7 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 			hitRate = float64(hits) / float64(totalRequests) * 100.0
 		}
 		ctx.Logger().Info("DockerHub scan cache statistics", 
-			"total_images", len(images),
+			"total_images", imageCount,
 			"cache_hits", hits, 
 			"cache_misses", misses, 
 			"cache_size", size, 
@@ -399,76 +409,78 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 	return nil
 }
 
-// enumerateImages discovers all repositories and their tags from DockerHub
-func (s *Source) enumerateImages(ctx context.Context) ([]string, error) {
-	var allImages []string
-	var mu sync.Mutex
+// enumerateImagesStream discovers images and streams them through the provided channel
+func (s *Source) enumerateImagesStream(ctx context.Context, imageChan chan<- string) error {
+	var sent sync.Map // to prevent duplicate image scans
 
 	workers := new(errgroup.Group)
 	workers.SetLimit(s.concurrency)
 
+	sendImage := func(img string) error {
+		if _, loaded := sent.LoadOrStore(img, struct{}{}); loaded {
+			return nil // duplicate
+		}
+		return common.CancellableWrite(ctx, imageChan, img)
+	}
+
 	// Enumerate repositories for specified organizations
 	for _, org := range s.conn.Organizations {
-		org := org
+		orgCopy := org
 		workers.Go(func() error {
 			if common.IsDone(ctx) {
 				return nil
 			}
-
-			repos, err := s.getRepositoriesForOrganization(ctx, org)
+			repos, err := s.getRepositoriesForOrganization(ctx, orgCopy)
 			if err != nil {
-				return fmt.Errorf("failed to get repositories for org %s: %w", org, err)
+				return fmt.Errorf("failed to get repositories for org %s: %w", orgCopy, err)
 			}
-
 			for _, repo := range repos {
 				if common.IsDone(ctx) {
 					return nil
 				}
-
-				repoName := fmt.Sprintf("%s/%s", org, repo.Name)
-				if s.shouldIncludeRepository(repoName) {
-					images, err := s.getImagesForRepository(ctx, repoName)
-					if err != nil {
-						ctx.Logger().Error(err, "failed to get images for repository", "repo", repoName)
-						continue
+				repoName := fmt.Sprintf("%s/%s", orgCopy, repo.Name)
+				if !s.shouldIncludeRepository(repoName) {
+					continue
+				}
+				images, err := s.getImagesForRepository(ctx, repoName)
+				if err != nil {
+					ctx.Logger().Error(err, "failed to get images for repository", "repo", repoName)
+					continue
+				}
+				for _, img := range images {
+					if err := sendImage(img); err != nil {
+						return err
 					}
-
-					mu.Lock()
-					allImages = append(allImages, images...)
-					mu.Unlock()
 				}
 			}
 			return nil
 		})
 	}
 
-	// Add explicitly specified repositories
+	// Enumerate explicitly specified repositories
 	for _, repo := range s.conn.Repositories {
-		repo := repo
+		repoCopy := repo
 		workers.Go(func() error {
 			if common.IsDone(ctx) {
 				return nil
 			}
-
-			if s.shouldIncludeRepository(repo) {
-				images, err := s.getImagesForRepository(ctx, repo)
-				if err != nil {
-					return fmt.Errorf("failed to get images for repository %s: %w", repo, err)
+			if !s.shouldIncludeRepository(repoCopy) {
+				return nil
+			}
+			images, err := s.getImagesForRepository(ctx, repoCopy)
+			if err != nil {
+				return fmt.Errorf("failed to get images for repository %s: %w", repoCopy, err)
+			}
+			for _, img := range images {
+				if err := sendImage(img); err != nil {
+					return err
 				}
-
-				mu.Lock()
-				allImages = append(allImages, images...)
-				mu.Unlock()
 			}
 			return nil
 		})
 	}
 
-	if err := workers.Wait(); err != nil {
-		return nil, err
-	}
-
-	return allImages, nil
+	return workers.Wait()
 }
 
 // shouldIncludeRepository checks if a repository should be included based on include/exclude filters
