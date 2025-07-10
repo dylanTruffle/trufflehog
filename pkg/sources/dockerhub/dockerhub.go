@@ -150,7 +150,8 @@ func (s *Source) handleRateLimit(ctx context.Context, resp *http.Response) bool 
 
 	// Sleep for the retry duration
 	if retryAfter > 0 {
-		ctx.Logger().V(1).Info("Waiting for DockerHub rate limit to clear", 
+		// Use default verbosity to ensure users see long waits prominently
+		ctx.Logger().Info("Waiting for DockerHub rate limit to clear", 
 			"wait_duration", retryAfter.String())
 		
 		// Use a timer to allow for context cancellation
@@ -343,6 +344,9 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 	ctx = context.WithValue(ctx, "source_type", s.Type())
 	ctx = context.WithValue(ctx, "source_name", s.name)
 
+	// Initialize progress reporting
+	s.Progress.SetProgressOngoing("Starting DockerHub enumeration", "")
+
 	// Channel for streaming image names from enumeration to scanners
 	imageChan := make(chan string, 100)
 
@@ -351,8 +355,9 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 	enumGroup.SetLimit(s.concurrency)
 	scanGroup.SetLimit(s.concurrency)
 
-	// Counter for logging
-	var imageCount int64
+	// Counters for progress
+	var imageCount int64      // scanned images
+	var enumeratedCount int64 // enumerated images
 
 	// Start enumeration in separate goroutine so scanning can start immediately
 	enumGroup.Go(func() error {
@@ -372,6 +377,7 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 					scanErrs.Add(fmt.Errorf("failed to scan image %s: %w", image, err))
 				}
 				atomic.AddInt64(&imageCount, 1)
+				progressScannedUpdate(atomic.LoadInt64(&imageCount))
 			}
 			if scanErrs.Count() > 0 {
 				return fmt.Errorf("scan errors: %s", scanErrs.String())
@@ -387,6 +393,8 @@ func (s *Source) Chunks(ctx context.Context, chunksChan chan *sources.Chunk, _ .
 	if err := scanGroup.Wait(); err != nil {
 		ctx.Logger().V(2).Info("errors during scanning", "error", err)
 	}
+
+	s.Progress.SetProgressComplete(int(imageCount), int(imageCount), fmt.Sprintf("Finished scanning %d images", imageCount), "")
 
 	ctx.Logger().Info("scanned Docker images", "count", imageCount)
 
@@ -451,6 +459,8 @@ func (s *Source) enumerateImagesStream(ctx context.Context, imageChan chan<- str
 					if err := sendImage(img); err != nil {
 						return err
 					}
+					cnt := atomic.AddInt64(&enumeratedCount, 1)
+					progressEnumeratedUpdate(cnt)
 				}
 			}
 			return nil
@@ -475,6 +485,8 @@ func (s *Source) enumerateImagesStream(ctx context.Context, imageChan chan<- str
 				if err := sendImage(img); err != nil {
 					return err
 				}
+				cnt := atomic.AddInt64(&enumeratedCount, 1)
+				progressEnumeratedUpdate(cnt)
 			}
 			return nil
 		})
