@@ -2,6 +2,7 @@ package docker
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/trufflesecurity/trufflehog/v3/pkg/cache/memory"
@@ -18,12 +19,12 @@ type LayerScanResult struct {
 
 // LayerCache provides caching for Docker layer scan results
 type LayerCache struct {
-	cache     *memory.Cache[*LayerScanResult]
-	hits      int64
-	misses    int64
-	mu        sync.RWMutex
-	maxSize   int
-	enabled   bool
+	cache   *memory.Cache[*LayerScanResult]
+	hits    int64 // accessed atomically
+	misses  int64 // accessed atomically
+	mu      sync.RWMutex
+	maxSize int
+	enabled bool
 }
 
 // NewLayerCache creates a new layer cache with the specified maximum size
@@ -48,16 +49,13 @@ func (lc *LayerCache) Get(digest v1.Hash) (*LayerScanResult, bool) {
 		return nil, false
 	}
 
-	lc.mu.RLock()
-	defer lc.mu.RUnlock()
-
 	result, found := lc.cache.Get(digest.String())
 	if found {
-		lc.hits++
+		atomic.AddInt64(&lc.hits, 1)
 		return result, true
 	}
 
-	lc.misses++
+	atomic.AddInt64(&lc.misses, 1)
 	return nil, false
 }
 
@@ -86,9 +84,10 @@ func (lc *LayerCache) Set(digest v1.Hash, result *LayerScanResult) {
 
 // GetStats returns cache statistics
 func (lc *LayerCache) GetStats() (hits, misses int64, size int) {
-	lc.mu.RLock()
-	defer lc.mu.RUnlock()
-	return lc.hits, lc.misses, lc.cache.Count()
+	hits = atomic.LoadInt64(&lc.hits)
+	misses = atomic.LoadInt64(&lc.misses)
+	size = lc.cache.Count()
+	return
 }
 
 // Clear removes all cached entries
@@ -96,8 +95,8 @@ func (lc *LayerCache) Clear() {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	lc.cache.Clear()
-	lc.hits = 0
-	lc.misses = 0
+	atomic.StoreInt64(&lc.hits, 0)
+	atomic.StoreInt64(&lc.misses, 0)
 }
 
 // SetEnabled enables or disables the cache
