@@ -95,7 +95,7 @@ trufflehog dockerhub --orgs "myorg" --include-repos "prod-" --ignore-repos "test
 ### ⚠️ Known Issues
 - Protobuf files need to be regenerated with `make protos` command
 - Test files require context fixes for proper compilation
-- CLI integration needs to be added to main.go
+- CLI integration implemented in main.go (`trufflehog dockerhub`)
 
 ### 🚧 Remaining Work
 1. **Protobuf Regeneration**: Run `make protos` to properly generate protobuf files

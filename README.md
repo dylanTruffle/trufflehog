@@ -251,13 +251,34 @@ Use the `--image` flag multiple times to scan multiple images.
 trufflehog docker --image trufflesecurity/secrets --only-verified
 ```
 
-## 11: Scan in CI
+## 11: Scan DockerHub repositories or organisations
 
-Set the `--since-commit` flag to your default branch that people merge into (ex: "main"). Set the `--branch` flag to your PR's branch name (ex: "feature-1"). Depending on the CI/CD platform you use, this value can be pulled in dynamically (ex: [CIRCLE_BRANCH in Circle CI](https://circleci.com/docs/variables/) and [TRAVIS_PULL_REQUEST_BRANCH in Travis CI](https://docs.travis-ci.com/user/environment-variables/)). If the repo is cloned and the target branch is already checked out during the CI/CD workflow, then `--branch HEAD` should be sufficient. The `--fail` flag will return an 183 error code if valid credentials are found.
+Use the `dockerhub` sub-command to enumerate images in one or more repositories or organisations and scan them just like regular Docker images.  You may supply authentication to increase rate-limits with `--username / --password` or a personal access token via `--token` (recommended).
+
+Scan a single public repository (first 3 tags):
 
 ```bash
-trufflehog git file://. --since-commit main --branch feature-1 --only-verified --fail
+trufflehog dockerhub --repo library/ubuntu --max-tags 3 --only-verified
 ```
+
+Scan an organisation with an auth token, including only repositories whose names start with `prod-` and explicitly ignoring any `test-*` repos:
+
+```bash
+trufflehog dockerhub \
+  --org my-company \
+  --include-repo "prod-*" \
+  --ignore-repo "test-*" \
+  --token $DOCKERHUB_TOKEN \
+  --max-tags 10
+```
+
+The full list of DockerHub-specific flags can be viewed with:
+
+```bash
+trufflehog dockerhub --help
+```
+
+---
 
 ## 12: Scan a Postman workspace
 
@@ -334,6 +355,7 @@ TruffleHog has a sub-command for each source of data that you may want to scan:
 - github
 - gitlab
 - docker
+- dockerhub
 - s3
 - filesystem (files and directories)
 - syslog
