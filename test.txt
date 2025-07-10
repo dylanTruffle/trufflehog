@@ -1,0 +1,2 @@
+This is a test file that will trigger the git filter.
+It contains some dummy content for testing purposes.
